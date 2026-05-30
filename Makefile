@@ -9,10 +9,10 @@ push:
 	./scripts/push.sh
 
 up:
-	./scripts/up.sh
+	./manage.sh up
 
 down:
-	./scripts/down.sh
+	./manage.sh down
 
 logs:
-	./scripts/logs.sh
+	./manage.sh logs

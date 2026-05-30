@@ -1,8 +1,6 @@
 services:
   cache-server:
     image: ghcr.io/falcondev-oss/github-actions-cache-server
-    ports:
-      - "3000:3000"
     environment:
       API_BASE_URL: http://cache-server:3000
       STORAGE_DRIVER: filesystem
