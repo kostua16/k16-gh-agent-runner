@@ -20,8 +20,11 @@ services:
     environment:
       CUSTOM_ACTIONS_RESULTS_URL: http://cache-server:3000/
     volumes:
+      - runner-data:/home/runner
       - /var/run/docker.sock:/var/run/docker.sock
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:
   cache-data:
+  runner-data:

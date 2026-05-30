@@ -101,6 +101,18 @@ This will:
 
 If `.env` already exists, you can **keep**, **overwrite**, or **edit** selected keys.
 
+To refresh runtime files on an existing install (new `docker-compose.yml`, `manage.sh`, merged `.env` keys), then restart with the latest image:
+
+```bash
+./manage.sh upgrade
+# or:
+curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --update
+```
+
+This downloads updated files from `main`, merges any new keys from `.env.example` into your existing `.env` (keeping your values), and runs `down` → `pull` → `up`.
+
+`./manage.sh upgrade` is safe while `manage.sh` is running: the updater writes to a temp file and atomically replaces the on-disk script, so the current process keeps the old inode until it exits. The next `./manage.sh` invocation uses the new version.
+
 ### Migrate from an existing self-hosted runner
 
 If you already have a classic [`actions-runner`](https://github.com/actions/runner) install (for example `~/actions-runner` with `svc.sh` and `.runner`):
@@ -139,6 +151,7 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 ./manage.sh ps             # status
 ./manage.sh restart
 ./manage.sh pull           # pull latest images
+./manage.sh upgrade        # refresh files + restart stack
 ```
 
 | Command | Description |
@@ -165,6 +178,9 @@ Copy [`.env.example`](.env.example) to `.env` or run the [install curl command](
 | `RUNNER_LABELS` | Comma-separated labels (default includes `docker`) |
 | `RUNNER_DISABLE_UPDATE` | `true` to disable runner self-update |
 | `RUNNER_EPHEMERAL` | `true` for ephemeral runners |
+| `RUNNER_REMOVE_ON_EXIT` | `true` to deregister from GitHub on container stop (default: keep registration) |
+
+Runner registration state is stored in the **`runner-data` Docker volume** (`/home/runner` inside the container). After the first successful start, `down` → `up` reuses credentials and does not need a fresh `RUNNER_TOKEN`. To force re-registration, run `docker compose down -v` (or `./manage.sh down` then remove the `runner-data` volume) and provide a new token.
 
 Optional workflow API keys can be added during install or appended to `.env` manually.
 

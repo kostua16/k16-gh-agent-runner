@@ -12,6 +12,7 @@ RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
 MIGRATE_PATH=""
 MIGRATE_SOURCE=""
 CLI_TOKEN=""
+DO_UPDATE=0
 RUNNER_HEALTH_WARN=0
 
 ENV_KEYS=()
@@ -112,6 +113,8 @@ Options:
                     prefers `gh api` for a new registration token.
   --token TOKEN     Runner registration token (skips token prompt and
                     overrides gh/legacy token lookup in --migrate)
+  --update          Refresh manage.sh, .env.example, and docker-compose.yml;
+                    merge new keys into existing .env, then down → pull → up
   -h, --help        Show this help
 
 Environment:
@@ -124,6 +127,7 @@ Examples:
   curl -fsSL .../install.sh | bash
   curl -fsSL .../install.sh | bash -s -- --token "$RUNNER_TOKEN"
   curl -fsSL .../install.sh | bash -s -- --migrate --token "$RUNNER_TOKEN"
+  curl -fsSL .../install.sh | bash -s -- --update
   ./install.sh --migrate ~/actions-runner --token "$RUNNER_TOKEN"
 EOF
 }
@@ -132,6 +136,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --migrate)
+        [[ "$DO_UPDATE" == "0" ]] || die "--migrate and --update cannot be used together"
         if [[ $# -ge 2 && "$2" != --* ]]; then
           MIGRATE_PATH="$2"
           shift 2
@@ -139,6 +144,11 @@ parse_args() {
           MIGRATE_PATH="${HOME}/actions-runner"
           shift
         fi
+        ;;
+      --update)
+        [[ -z "$MIGRATE_PATH" ]] || die "--migrate and --update cannot be used together"
+        DO_UPDATE=1
+        shift
         ;;
       --token)
         [[ $# -ge 2 ]] || die "--token requires a value"
@@ -205,11 +215,15 @@ preflight() {
 
 download_runtime_files() {
   local files=(.env.example manage.sh docker-compose.yml)
-  local f dest
+  local f dest tmp
   for f in "${files[@]}"; do
     dest="${INSTALL_DIR}/${f}"
+    tmp="${INSTALL_DIR}/.${f}.new.$$"
     echo "==> Downloading ${f}"
-    curl -fsSL "${RAW_BASE}/${f}" -o "$dest"
+    curl -fsSL "${RAW_BASE}/${f}" -o "$tmp"
+    # Atomic replace: safe when ./manage.sh upgrade is running (avoids truncating
+    # the script bash is still reading; also avoids ETXTBSY on some Linux setups).
+    mv "$tmp" "$dest"
   done
   chmod +x "${INSTALL_DIR}/manage.sh"
 }
@@ -252,7 +266,7 @@ normalize_bool() {
 
 is_bool_key() {
   case "$1" in
-    RUNNER_DISABLE_UPDATE | RUNNER_EPHEMERAL) return 0 ;;
+    RUNNER_DISABLE_UPDATE | RUNNER_EPHEMERAL | RUNNER_REMOVE_ON_EXIT) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -768,6 +782,41 @@ run_migration() {
   migrate_stop "$MIGRATE_SOURCE"
 }
 
+merge_env_update() {
+  local env_file="${INSTALL_DIR}/.env"
+  [[ -f "$env_file" ]] || die ".env not found in ${INSTALL_DIR}; run a fresh install first"
+
+  echo "==> Merging ${env_file} with .env.example"
+  parse_env_example
+  load_existing_env
+  write_env_file
+  echo "  preserved existing values; added any new keys from .env.example"
+}
+
+refresh_stack() {
+  echo "==> Refreshing stack (down → pull → up)"
+  (cd "$INSTALL_DIR" && ./manage.sh down)
+  (cd "$INSTALL_DIR" && ./manage.sh pull)
+  if runner_token_set; then
+    :
+  elif [[ "$DO_UPDATE" == "1" ]]; then
+    echo "  RUNNER_TOKEN not set in .env; assuming runner-data volume has credentials"
+  else
+    require_runner_token
+  fi
+  (cd "$INSTALL_DIR" && ./manage.sh up)
+  check_runner_health || RUNNER_HEALTH_WARN=1
+}
+
+run_update() {
+  [[ -f "${INSTALL_DIR}/.env" ]] || die "nothing to update in ${INSTALL_DIR}; run a fresh install first"
+
+  download_runtime_files
+  merge_env_update
+  refresh_stack
+  print_summary
+}
+
 configure_env() {
   parse_env_example
   apply_supplied_token || true
@@ -875,11 +924,17 @@ EOF
 
 main() {
   preflight
+  mkdir -p "$INSTALL_DIR"
+  cd "$INSTALL_DIR"
+
+  if [[ "$DO_UPDATE" == "1" ]]; then
+    run_update
+    return 0
+  fi
+
   if [[ -n "$MIGRATE_PATH" ]]; then
     run_migration
   fi
-  mkdir -p "$INSTALL_DIR"
-  cd "$INSTALL_DIR"
   download_runtime_files
   configure_env
   start_stack

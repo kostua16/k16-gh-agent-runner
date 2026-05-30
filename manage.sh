@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+INSTALL_SH_URL="https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh"
 COMPOSE=(docker compose -f docker-compose.yml)
 
 require_compose() {
@@ -33,6 +34,7 @@ Commands:
   ps, status      Show container status
   restart [svc]   Restart services
   pull            Pull latest images
+  upgrade         Refresh runtime files and restart (install.sh --update)
   menu            Interactive menu (default when no args)
   help            Show this help
 
@@ -72,6 +74,10 @@ cmd_pull() {
   "${COMPOSE[@]}" pull
 }
 
+cmd_upgrade() {
+  curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update
+}
+
 run_command() {
   local cmd="${1:-}"
   shift || true
@@ -82,6 +88,7 @@ run_command() {
     ps | status) cmd_ps ;;
     restart) cmd_restart "$@" ;;
     pull) cmd_pull ;;
+    upgrade) cmd_upgrade ;;
     help | -h | --help) usage ;;
     menu | "") menu_loop ;;
     *)
@@ -98,7 +105,7 @@ menu_loop() {
     echo
     PS3="Choose an action: "
     # shellcheck disable=SC2034
-    select choice in "Up" "Down" "Logs" "Status" "Restart" "Pull" "Quit"; do
+    select choice in "Up" "Down" "Logs" "Status" "Restart" "Pull" "Upgrade" "Quit"; do
       case "$REPLY" in
         1)
           cmd_up
@@ -124,6 +131,10 @@ menu_loop() {
           read -r -p "Press Enter to continue..."
           ;;
         7)
+          cmd_upgrade
+          read -r -p "Press Enter to continue..."
+          ;;
+        8)
           exit 0
           ;;
         *)
