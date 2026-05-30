@@ -114,15 +114,17 @@ curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/i
 This will:
 
 1. Verify the legacy directory (`.runner`, `svc.sh`)
-2. Stop the legacy service (`svc.sh stop`) and terminate listener processes (SIGTERM, then SIGKILL if needed)
+2. Stop the legacy service when active (uses `sudo -n` only — no password prompts; skips stop when already inactive)
 3. Import `GITHUB_URL` and `RUNNER_NAME` from `.runner`
-4. Obtain a new `RUNNER_TOKEN` via `gh api` when `gh auth login` is active; otherwise read legacy `.env` or prompt
-5. Fetch `RUNNER_LABELS` from GitHub when possible (adds `docker` if missing)
+4. Obtain a new `RUNNER_TOKEN` via `gh api` when available; otherwise use `--token`, legacy `.env`, or prompt
+5. Set `RUNNER_LABELS` from GitHub when possible, otherwise auto-default to `self-hosted,<OS>,<ARCH>,docker`
 6. Write `~/k16-gh-agent-runner/.env` and start the Docker stack
 
 Requires **jq** for `--migrate`. **gh** is strongly recommended (`gh auth login`) so the script can fetch a fresh registration token and runner labels. Without `gh`, pass `--token` or export `RUNNER_TOKEN` (legacy `.env` tokens are often empty or expired).
 
-When piped via `curl | bash`, prompts read from `/dev/tty` when available; labels default to `self-hosted,<OS>,<ARCH>,docker` if `gh` cannot fetch them.
+When the legacy runner used systemd, migrate **stops** the unit but leaves it **enabled** — it may start again on reboot until you uninstall it manually. Migrate does not prompt for `sudo` passwords; if the unit is already inactive, no stop is attempted.
+
+After start, the installer checks whether the runner container stays running and warns if it is restarting or exited.
 
 Operator scripts (`install.sh`, `manage.sh`) run on **macOS default bash 3.2** (`/bin/bash`).
 

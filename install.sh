@@ -12,6 +12,7 @@ RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
 MIGRATE_PATH=""
 MIGRATE_SOURCE=""
 CLI_TOKEN=""
+RUNNER_HEALTH_WARN=0
 
 ENV_KEYS=()
 ENV_VALS=()
@@ -64,20 +65,24 @@ read_line() {
   fd="$(prompt_fd)" || return 1
   if [[ "$secret" == 1 ]]; then
     read -r -s -p "$prompt" reply <"$fd"
-    echo
+    printf '\n' >"$fd"
   else
     read -r -p "$prompt" reply <"$fd"
   fi
   printf '%s' "$reply"
 }
 
+token_nonempty() {
+  [[ -n "${1//[[:space:]]/}" ]]
+}
+
 apply_supplied_token() {
-  if [[ -n "$CLI_TOKEN" ]]; then
+  if token_nonempty "$CLI_TOKEN"; then
     echo "  using RUNNER_TOKEN from --token"
     env_set "RUNNER_TOKEN" "$CLI_TOKEN"
     return 0
   fi
-  if [[ -n "${RUNNER_TOKEN:-}" ]]; then
+  if token_nonempty "${RUNNER_TOKEN:-}"; then
     echo "  using RUNNER_TOKEN from environment"
     env_set "RUNNER_TOKEN" "$RUNNER_TOKEN"
     return 0
@@ -88,7 +93,7 @@ apply_supplied_token() {
 runner_token_set() {
   local token
   token="$(env_get RUNNER_TOKEN 2>/dev/null || true)"
-  [[ -n "$token" ]]
+  token_nonempty "$token"
 }
 
 die() {
@@ -138,12 +143,12 @@ parse_args() {
       --token)
         [[ $# -ge 2 ]] || die "--token requires a value"
         CLI_TOKEN="$2"
-        [[ -n "$CLI_TOKEN" ]] || die "--token value cannot be empty"
+        token_nonempty "$CLI_TOKEN" || die "--token value cannot be empty"
         shift 2
         ;;
       --token=*)
         CLI_TOKEN="${1#--token=}"
-        [[ -n "$CLI_TOKEN" ]] || die "--token value cannot be empty"
+        token_nonempty "$CLI_TOKEN" || die "--token value cannot be empty"
         shift
         ;;
       -h | --help)
@@ -263,7 +268,7 @@ prompt_key() {
     fi
     while true; do
       input="$(read_line "${key} (required, hidden): " 1)" || die "RUNNER_TOKEN required (stdin is not a TTY; use --token, export RUNNER_TOKEN, or use a terminal)"
-      if [[ -n "$input" ]]; then
+      if token_nonempty "$input"; then
         env_set "$key" "$input"
         return
       fi
@@ -318,7 +323,7 @@ prompt_optional_api_keys() {
   local key val
   for key in "${OPTIONAL_API_KEYS[@]}"; do
     val="$(read_line "${key} (optional, hidden): " 1)" || break
-    if [[ -n "$val" ]]; then
+    if token_nonempty "$val"; then
       echo "${key}=${val}" >>"${INSTALL_DIR}/.env"
     fi
   done
@@ -408,20 +413,53 @@ migrate_svc_name() {
   printf '%s' "$line"
 }
 
+migrate_systemd_unit() {
+  local path="$1" unit=""
+  if [[ -f "${path}/.service" ]]; then
+    unit="$(tr -d '[:space:]' <"${path}/.service")"
+  fi
+  if [[ -z "$unit" ]]; then
+    unit="$(migrate_svc_name "$path")"
+  fi
+  printf '%s' "$unit"
+}
+
+migrate_systemd_active() {
+  local unit="$1"
+  [[ -n "$unit" ]] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit" 2>/dev/null
+}
+
+migrate_stop_systemd() {
+  local path="$1" unit
+  unit="$(migrate_systemd_unit "$path")"
+  [[ -n "$unit" ]] || return 0
+
+  if migrate_systemd_active "$unit"; then
+    echo "  stopping systemd unit ${unit}"
+    if command -v sudo >/dev/null 2>&1 && sudo -n systemctl stop "$unit" 2>/dev/null; then
+      echo "  systemd unit stopped"
+    else
+      echo "warning: could not stop ${unit} without a password (sudo -n failed); continuing with process signals" >&2
+    fi
+  else
+    echo "  systemd unit already inactive (${unit})"
+  fi
+}
+
 migrate_run_svc() {
   local path="$1" action="$2"
   local out rc=0
 
   out="$(cd "$path" && ./svc.sh "$action" 2>&1)" || rc=$?
   if [[ $rc -eq 0 ]]; then
-    [[ -n "$out" ]] && printf '%s\n' "$out"
     return 0
   fi
 
-  printf '%s\n' "$out"
   if grep -qi 'must run as sudo' <<<"$out" && command -v sudo >/dev/null 2>&1; then
-    echo "  retrying svc.sh ${action} with sudo"
-    (cd "$path" && sudo ./svc.sh "$action") || true
+    if (cd "$path" && sudo -n ./svc.sh "$action" 2>/dev/null); then
+      return 0
+    fi
+    echo "warning: svc.sh ${action} requires sudo password; skipped" >&2
   fi
 }
 
@@ -463,7 +501,7 @@ migrate_collect_pids() {
 
 migrate_detect_running() {
   local path="$1"
-  local svc_name status_out
+  local svc_name status_out unit
 
   echo "==> Checking legacy runner status"
 
@@ -479,15 +517,14 @@ migrate_detect_running() {
       fi
     fi
   elif grep -q systemctl "${path}/svc.sh" 2>/dev/null; then
-    svc_name="$(migrate_svc_name "$path")"
-    if [[ -n "$svc_name" ]] && command -v systemctl >/dev/null 2>&1; then
-      if systemctl is-active --quiet "$svc_name" 2>/dev/null; then
-        echo "  systemctl: active (${svc_name})"
+    unit="$(migrate_systemd_unit "$path")"
+    if [[ -n "$unit" ]] && command -v systemctl >/dev/null 2>&1; then
+      if migrate_systemd_active "$unit"; then
+        echo "  systemctl: active (${unit})"
       else
-        echo "  systemctl: inactive (${svc_name})"
+        echo "  systemctl: inactive (${unit})"
       fi
     fi
-    migrate_run_svc "$path" status
   fi
 
   local pid
@@ -517,7 +554,9 @@ migrate_stop() {
 
   echo "==> Stopping legacy runner"
 
-  if [[ -f "${path}/.service" ]] && [[ -x "${path}/svc.sh" ]]; then
+  if grep -q systemctl "${path}/svc.sh" 2>/dev/null; then
+    migrate_stop_systemd "$path"
+  elif [[ -f "${path}/.service" ]] && [[ -x "${path}/svc.sh" ]]; then
     echo "  running svc.sh stop"
     migrate_run_svc "$path" stop
   fi
@@ -617,7 +656,7 @@ read_legacy_runner_token() {
       val="${BASH_REMATCH[1]}"
       val="${val%\"}"
       val="${val#\"}"
-      [[ -n "$val" ]] || return 1
+      token_nonempty "$val" || return 1
       printf '%s' "$val"
       return 0
     fi
@@ -630,7 +669,10 @@ prompt_registration_token() {
   echo "Generate a registration token: GitHub → Settings → Actions → Runners → New self-hosted runner"
   while true; do
     input="$(read_line "RUNNER_TOKEN (required, hidden): " 1)" || die "RUNNER_TOKEN required (stdin is not a TTY; use --token, export RUNNER_TOKEN, or install gh and run gh auth login)"
-    [[ -n "$input" ]] && env_set "RUNNER_TOKEN" "$input" && return
+    if token_nonempty "$input"; then
+      env_set "RUNNER_TOKEN" "$input"
+      return
+    fi
     echo "  RUNNER_TOKEN cannot be empty."
   done
 }
@@ -674,7 +716,7 @@ migrate_extract_config() {
         env_set "RUNNER_TOKEN" "$token"
       else
         if ! command -v gh >/dev/null 2>&1; then
-          echo "warning: gh is not installed — cannot fetch a registration token automatically" >&2
+          echo "warning: gh is not installed on this host — pass --token or export RUNNER_TOKEN" >&2
         fi
         prompt_registration_token
       fi
@@ -695,12 +737,7 @@ migrate_extract_config() {
     fi
     if [[ -z "$labels" ]]; then
       labels="$(migrate_default_labels)"
-    fi
-    input="$(read_line "RUNNER_LABELS [${labels}]: ")" || true
-    if [[ -n "$input" ]]; then
-      labels="$input"
-    elif ! prompt_fd >/dev/null 2>&1; then
-      echo "  using default RUNNER_LABELS=${labels} (non-interactive; edit .env to change)"
+      echo "  using default RUNNER_LABELS=${labels}"
     fi
   fi
   env_set "RUNNER_LABELS" "$(merge_docker_label "$labels")"
@@ -783,15 +820,40 @@ start_stack() {
   require_runner_token
   echo "==> Starting stack"
   (cd "$INSTALL_DIR" && ./manage.sh up)
+  check_runner_health || RUNNER_HEALTH_WARN=1
+}
+
+check_runner_health() {
+  local waits=5 id
+  while ((waits > 0)); do
+    sleep 2
+    id="$(cd "$INSTALL_DIR" && docker compose ps -q --status running runner 2>/dev/null || true)"
+    if [[ -n "$id" ]]; then
+      return 0
+    fi
+    waits=$((waits - 1))
+  done
+  echo "warning: runner container is not healthy yet — check logs:" >&2
+  echo "  cd ${INSTALL_DIR} && ./manage.sh logs runner" >&2
+  return 1
 }
 
 print_summary() {
-  cat <<EOF
+  if [[ "$RUNNER_HEALTH_WARN" == "1" ]]; then
+    cat <<EOF
+
+==> Installation finished with warnings
+
+Directory: ${INSTALL_DIR}
+EOF
+  else
+    cat <<EOF
 
 ==> Installation complete
 
 Directory: ${INSTALL_DIR}
 EOF
+  fi
   if [[ -n "$MIGRATE_SOURCE" ]]; then
     cat <<EOF
 Migrated from: ${MIGRATE_SOURCE}
