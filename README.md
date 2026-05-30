@@ -180,7 +180,16 @@ Copy [`.env.example`](.env.example) to `.env` or run the [install curl command](
 | `RUNNER_EPHEMERAL` | `true` for ephemeral runners |
 | `RUNNER_REMOVE_ON_EXIT` | `true` to deregister from GitHub on container stop (default: keep registration) |
 
-Runner registration state is stored in the **`runner-data` Docker volume** (`/home/runner` inside the container). After the first successful start, `down` → `up` reuses credentials and does not need a fresh `RUNNER_TOKEN`. To force re-registration, run `docker compose down -v` (or `./manage.sh down` then remove the `runner-data` volume) and provide a new token.
+Runner registration state is stored in the **`runner-data` Docker volume** (mounted at `/config` in the container). After the first successful start, `down` → `up` reuses credentials and does not need a fresh `RUNNER_TOKEN`. To force re-registration, run `docker compose down -v` (or `./manage.sh down` then remove the `runner-data` volume) and provide a new token.
+
+### Session conflict after restart
+
+If logs show `A session for this runner already exists`:
+
+1. Stop any **legacy** host runner (`~/actions-runner` systemd service) — migrate stops it once but leaves the unit enabled.
+2. Run `./manage.sh down`, wait ~30s, then `./manage.sh up`.
+3. Ensure the image includes the latest `runner.sh` (`./manage.sh upgrade` updates compose files; rebuild/push the image for entrypoint changes).
+4. Set `RUNNER_REPLACE=true` in `.env` only when you intentionally need to re-register with a fresh `RUNNER_TOKEN`.
 
 Optional workflow API keys can be added during install or appended to `.env` manually.
 

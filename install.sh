@@ -266,7 +266,7 @@ normalize_bool() {
 
 is_bool_key() {
   case "$1" in
-    RUNNER_DISABLE_UPDATE | RUNNER_EPHEMERAL | RUNNER_REMOVE_ON_EXIT) return 0 ;;
+    RUNNER_DISABLE_UPDATE | RUNNER_EPHEMERAL | RUNNER_REMOVE_ON_EXIT | RUNNER_REPLACE) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -796,6 +796,9 @@ merge_env_update() {
 refresh_stack() {
   echo "==> Refreshing stack (down → pull → up)"
   (cd "$INSTALL_DIR" && ./manage.sh down)
+  echo "==> Waiting for GitHub runner session to clear (20s)..."
+  sleep 20
+  warn_host_legacy_runner || true
   (cd "$INSTALL_DIR" && ./manage.sh pull)
   if runner_token_set; then
     :
@@ -806,6 +809,33 @@ refresh_stack() {
   fi
   (cd "$INSTALL_DIR" && ./manage.sh up)
   check_runner_health || RUNNER_HEALTH_WARN=1
+}
+
+warn_host_legacy_runner() {
+  local path legacy_path pid unit active=0
+
+  for path in "${HOME}/actions-runner" "${INSTALL_DIR}/../actions-runner"; do
+    expanded="$(expand_user_path "$path" 2>/dev/null || true)"
+    [[ -d "$expanded" && -f "${expanded}/svc.sh" ]] || continue
+    legacy_path="$expanded"
+
+    unit="$(migrate_systemd_unit "$legacy_path" 2>/dev/null || true)"
+    if migrate_systemd_active "$unit" 2>/dev/null; then
+      echo "warning: legacy systemd runner is active (${unit}) — stop it or the Docker runner may fail with session conflict" >&2
+      echo "  sudo systemctl stop ${unit}" >&2
+      active=1
+    fi
+
+    if read -r pid < <(migrate_collect_pids "$legacy_path" 2>/dev/null | head -1); then
+      echo "warning: legacy runner processes still running under ${legacy_path} (pid ${pid})" >&2
+      active=1
+    fi
+  done
+
+  if [[ "$active" == "1" ]]; then
+    return 1
+  fi
+  return 0
 }
 
 run_update() {
@@ -867,6 +897,7 @@ configure_env() {
 
 start_stack() {
   require_runner_token
+  warn_host_legacy_runner || true
   echo "==> Starting stack"
   (cd "$INSTALL_DIR" && ./manage.sh up)
   check_runner_health || RUNNER_HEALTH_WARN=1

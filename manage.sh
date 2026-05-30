@@ -51,7 +51,8 @@ cmd_up() {
 }
 
 cmd_down() {
-  "${COMPOSE[@]}" down
+  "${COMPOSE[@]}" stop --timeout 60 runner 2>/dev/null || true
+  "${COMPOSE[@]}" down --timeout 60
 }
 
 cmd_logs() {
