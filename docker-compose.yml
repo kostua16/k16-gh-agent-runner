@@ -15,7 +15,7 @@ services:
 
   runner:
     build: .
-    image: k16-gh-agent-runner:latest
+    image: ${RUNNER_IMAGE:-ghcr.io/kostua16/k16-gh-agent-runner:latest}
     depends_on:
       - cache-server
     env_file:

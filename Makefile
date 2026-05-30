@@ -1,7 +1,10 @@
-.PHONY: build up down logs
+.PHONY: build push up down logs
 
 build:
 	./scripts/build.sh
+
+push:
+	./scripts/push.sh
 
 up:
 	./scripts/up.sh
