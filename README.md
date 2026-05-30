@@ -79,10 +79,16 @@ To build a slimmer image, set `INSTALL_*=false` in `env.build` before `make buil
 
 ## Install
 
-No git clone required:
+End users do **not** need a git clone. Download and run the installer from GitHub:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash
+```
+
+Pass options after `bash -s --` (same script, no local checkout):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --help
 ```
 
 This will:
@@ -90,24 +96,18 @@ This will:
 1. Create `~/k16-gh-agent-runner`
 2. Download `docker-compose.yml`, `.env.example`, and `manage.sh` from the `main` branch
 3. Run an interactive wizard to create `.env` (`RUNNER_TOKEN` is hidden input)
-4. Start the stack with `./manage.sh up`
+4. Start the stack with `./manage.sh up` in that directory
 
 If `.env` already exists, you can **keep**, **overwrite**, or **edit** selected keys.
-
-From a git clone:
-
-```bash
-./install.sh
-```
 
 ### Migrate from an existing self-hosted runner
 
 If you already have a classic [`actions-runner`](https://github.com/actions/runner) install (for example `~/actions-runner` with `svc.sh` and `.runner`):
 
 ```bash
-./install.sh --migrate
-# or
-./install.sh --migrate ~/actions-runner
+curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --migrate
+# or with a custom legacy path:
+curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --migrate ~/actions-runner
 ```
 
 This will:
@@ -149,7 +149,7 @@ From a clone, `make up`, `make down`, and `make logs` delegate to `manage.sh`.
 
 ## Configuration
 
-Copy [`.env.example`](.env.example) to `.env` or use `install.sh`.
+Copy [`.env.example`](.env.example) to `.env` or run the [install curl command](#install).
 
 | Variable | Description |
 |----------|-------------|
@@ -172,6 +172,8 @@ git clone https://github.com/kostua16/k16-gh-agent-runner.git
 cd k16-gh-agent-runner
 make build
 ```
+
+From a clone you can also run `./install.sh` locally (same behavior as the curl one-liner).
 
 - Uses [`env.build`](env.build) for version pins and [`docker-compose.build.yml`](docker-compose.build.yml) for the build overlay.
 - Override versions via environment variables or by editing `env.build`.
