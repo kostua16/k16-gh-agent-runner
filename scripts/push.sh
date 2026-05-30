@@ -19,7 +19,7 @@ fi
 
 USER="$(gh api user -q .login)"
 echo "Logging in to ghcr.io as ${USER}..."
-echo "$(gh auth token)" | docker login ghcr.io -u "${USER}" --password-stdin
+gh auth token | docker login ghcr.io -u "${USER}" --password-stdin
 
 "${ROOT}/scripts/build.sh"
 

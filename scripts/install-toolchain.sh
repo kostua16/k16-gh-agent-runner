@@ -6,7 +6,7 @@ RUNNER_USER="${RUNNER_USER:-runner}"
 RUNNER_HOME="${RUNNER_HOME:-/home/runner}"
 
 is_true() {
-  case "${1,,}" in
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
     true | 1 | yes) return 0 ;;
     *) return 1 ;;
   esac
@@ -257,9 +257,9 @@ if is_true "${INSTALL_RTK:-true}"; then
   verify_sha256 "$RTK_INSTALL_SHA256" /tmp/rtk-install.sh
   chown -R "${RUNNER_USER}:${RUNNER_USER}" "${RUNNER_HOME}/.local"
   as_runner "sh /tmp/rtk-install.sh"
-  as_runner "mkdir -p ~/.claude && ~/.local/bin/rtk init -g --auto-patch"
+  as_runner "mkdir -p ${RUNNER_HOME}/.claude && ${RUNNER_HOME}/.local/bin/rtk init -g --auto-patch"
   rm -f /tmp/rtk-install.sh
-  as_runner "~/.local/bin/rtk --version"
+  as_runner "${RUNNER_HOME}/.local/bin/rtk --version"
 fi
 
 if is_true "${INSTALL_CODEX:-true}"; then

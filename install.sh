@@ -1,30 +1,123 @@
 #!/usr/bin/env bash
 # Bootstrap ~/k16-gh-agent-runner and start the runner stack.
 # One-liner: curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash
+# Migrate:   ./install.sh --migrate [~/actions-runner]
 set -euo pipefail
-
-if ((BASH_VERSINFO[0] < 4)); then
-  echo "error: bash 4+ is required (install.sh uses associative arrays)" >&2
-  exit 1
-fi
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/k16-gh-agent-runner}"
 GITHUB_REPO="${GITHUB_REPO:-kostua16/k16-gh-agent-runner}"
 GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
 RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
 
-declare -A ENV_VALUES=()
-declare -a ENV_KEYS=()
-declare -a OPTIONAL_API_KEYS=(
+MIGRATE_PATH=""
+MIGRATE_SOURCE=""
+
+ENV_KEYS=()
+ENV_VALS=()
+OPTIONAL_API_KEYS=(
   ANTHROPIC_API_KEY
   ZAI_API_KEY
   OPENAI_API_KEY
   CURSOR_API_KEY
 )
 
+tolower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+env_get() {
+  local key="$1" i
+  for i in "${!ENV_KEYS[@]}"; do
+    if [[ "${ENV_KEYS[i]}" == "$key" ]]; then
+      printf '%s' "${ENV_VALS[i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+env_set() {
+  local key="$1" val="$2" i
+  for i in "${!ENV_KEYS[@]}"; do
+    if [[ "${ENV_KEYS[i]}" == "$key" ]]; then
+      ENV_VALS[i]="$val"
+      return 0
+    fi
+  done
+  ENV_KEYS+=("$key")
+  ENV_VALS+=("$val")
+}
+
 die() {
   echo "error: $*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: install.sh [options]
+
+Options:
+  --migrate [PATH]  Migrate from a legacy self-hosted runner install
+                    (default PATH: ~/actions-runner). Requires jq.
+                    Stops the old service, imports URL/name/labels, and
+                    prefers `gh api` for a new registration token.
+  -h, --help        Show this help
+
+Environment:
+  INSTALL_DIR       Target directory (default: ~/k16-gh-agent-runner)
+  GITHUB_REPO       Source repo for runtime files
+  GITHUB_BRANCH     Branch to download (default: main)
+
+Examples:
+  curl -fsSL .../install.sh | bash
+  ./install.sh
+  ./install.sh --migrate
+  ./install.sh --migrate ~/actions-runner
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --migrate)
+        if [[ $# -ge 2 && "$2" != --* ]]; then
+          MIGRATE_PATH="$2"
+          shift 2
+        else
+          MIGRATE_PATH="${HOME}/actions-runner"
+          shift
+        fi
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown argument: $1 (try --help)"
+        ;;
+    esac
+  done
+}
+
+expand_user_path() {
+  local p="$1"
+  case "$p" in
+    "~")
+      printf '%s' "$HOME"
+      ;;
+    *)
+      if [ "${p#~/}" != "$p" ]; then
+        printf '%s' "${HOME}/${p#~/}"
+      else
+        printf '%s' "$p"
+      fi
+      ;;
+  esac
+}
+
+gh_auth_ok() {
+  command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
 }
 
 require_cmd() {
@@ -36,6 +129,10 @@ preflight() {
   require_cmd curl
   require_cmd docker
   docker compose version >/dev/null 2>&1 || die "docker compose (v2 plugin) is required"
+
+  if [[ -n "$MIGRATE_PATH" ]]; then
+    require_cmd jq
+  fi
 
   if [[ ! -S /var/run/docker.sock ]] && [[ ! -S "${DOCKER_HOST:-}" ]]; then
     echo "warning: /var/run/docker.sock not found — runner jobs using Docker may fail" >&2
@@ -60,10 +157,11 @@ parse_env_example() {
   [[ -f "$example" ]] || die ".env.example not found"
 
   ENV_KEYS=()
+  ENV_VALS=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
       ENV_KEYS+=("${BASH_REMATCH[1]}")
-      ENV_VALUES["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+      ENV_VALS+=("${BASH_REMATCH[2]}")
     fi
   done <"$example"
 }
@@ -81,7 +179,8 @@ copy_env_header() {
 }
 
 normalize_bool() {
-  local v="${1,,}"
+  local v
+  v="$(tolower "$1")"
   case "$v" in
     true | 1 | yes | y) echo "true" ;;
     false | 0 | no | n) echo "false" ;;
@@ -98,15 +197,15 @@ is_bool_key() {
 
 prompt_key() {
   local key="$1"
-  local default="${ENV_VALUES[$key]:-}"
-  local input
+  local default input
+  default="$(env_get "$key" 2>/dev/null || true)"
 
   if [[ "$key" == "RUNNER_TOKEN" ]]; then
     while true; do
       read -r -s -p "${key} (required, hidden): " input
       echo
       if [[ -n "$input" ]]; then
-        ENV_VALUES["$key"]="$input"
+        env_set "$key" "$input"
         return
       fi
       echo "  RUNNER_TOKEN cannot be empty."
@@ -116,9 +215,9 @@ prompt_key() {
   if is_bool_key "$key"; then
     read -r -p "${key} [${default}] (true/false): " input
     if [[ -z "$input" ]]; then
-      ENV_VALUES["$key"]="$(normalize_bool "$default")"
+      env_set "$key" "$(normalize_bool "$default")"
     else
-      ENV_VALUES["$key"]="$(normalize_bool "$input")"
+      env_set "$key" "$(normalize_bool "$input")"
     fi
     return
   fi
@@ -129,9 +228,9 @@ prompt_key() {
     read -r -p "${key}: " input
   fi
   if [[ -z "$input" ]]; then
-    ENV_VALUES["$key"]="$default"
+    env_set "$key" "$default"
   else
-    ENV_VALUES["$key"]="$input"
+    env_set "$key" "$input"
   fi
 }
 
@@ -143,18 +242,19 @@ prompt_all_keys() {
 }
 
 write_env_file() {
-  local out="${INSTALL_DIR}/.env"
   copy_env_header
-  local key
+  local key val
   for key in "${ENV_KEYS[@]}"; do
-    echo "${key}=${ENV_VALUES[$key]}" >>"$out"
+    val="$(env_get "$key")"
+    echo "${key}=${val}" >>"${INSTALL_DIR}/.env"
   done
 }
 
 prompt_optional_api_keys() {
-  local add
+  local add add_lower
   read -r -p "Add optional workflow API keys? (y/N): " add
-  [[ "${add,,}" == "y" || "${add,,}" == "yes" ]] || return 0
+  add_lower="$(tolower "$add")"
+  [[ "$add_lower" == "y" || "$add_lower" == "yes" ]] || return 0
 
   local key val
   for key in "${OPTIONAL_API_KEYS[@]}"; do
@@ -176,7 +276,7 @@ edit_env_interactive() {
       if [[ "$key" == "RUNNER_TOKEN" ]]; then
         echo "  ${i}) ${key}=***"
       else
-        echo "  ${i}) ${key}=${ENV_VALUES[$key]}"
+        echo "  ${i}) ${key}=$(env_get "$key")"
       fi
       ((i++)) || true
     done
@@ -200,13 +300,337 @@ load_existing_env() {
     if [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
       key="${BASH_REMATCH[1]}"
       val="${BASH_REMATCH[2]}"
-      ENV_VALUES["$key"]="$val"
+      env_set "$key" "$val"
     fi
   done <"$env_file"
 }
 
+merge_docker_label() {
+  local labels="$1"
+  local IFS=,
+  local -a parts=()
+  local seen_docker=0 part
+  read -ra parts <<<"$labels"
+  for part in "${parts[@]}"; do
+    part="${part#"${part%%[![:space:]]*}"}"
+    part="${part%"${part##*[![:space:]]}"}"
+    [[ -z "$part" ]] && continue
+    [[ "$part" == "docker" ]] && seen_docker=1
+  done
+  if ((seen_docker)); then
+    printf '%s' "$labels"
+    return
+  fi
+  if [[ -n "$labels" ]]; then
+    printf '%s,docker' "$labels"
+  else
+    printf 'docker'
+  fi
+}
+
+migrate_validate() {
+  local expanded resolved
+  expanded="$(expand_user_path "$MIGRATE_PATH")"
+  resolved="$(cd "$expanded" 2>/dev/null && pwd)" || die "migrate path not found: ${MIGRATE_PATH}"
+  MIGRATE_SOURCE="$resolved"
+
+  [[ -f "${MIGRATE_SOURCE}/.runner" ]] || die "missing .runner in ${MIGRATE_SOURCE}"
+  [[ -f "${MIGRATE_SOURCE}/svc.sh" ]] || die "missing svc.sh in ${MIGRATE_SOURCE}"
+
+  echo "==> Migrating from ${MIGRATE_SOURCE}"
+}
+
+migrate_svc_name() {
+  local path="$1"
+  local line
+  line="$(grep -m1 '^SVC_NAME=' "${path}/svc.sh" 2>/dev/null || true)"
+  line="${line#SVC_NAME=}"
+  line="${line%\"}"
+  line="${line#\"}"
+  printf '%s' "$line"
+}
+
+migrate_collect_pids() {
+  local path="$1"
+  local -a collected=()
+  local pattern pid cmd seen="|"
+  local patterns=("Runner.Listener" "RunnerService.js" "runsvc.sh" "run-helper.sh")
+
+  for pattern in "${patterns[@]}"; do
+    while read -r pid; do
+      [[ -z "$pid" ]] && continue
+      kill -0 "$pid" 2>/dev/null || continue
+      cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+      [[ "$cmd" == *"${path}"* ]] || continue
+      [[ "$seen" == *"|${pid}|"* ]] && continue
+      collected+=("$pid")
+      seen="${seen}${pid}|"
+    done < <(pgrep -f "$pattern" 2>/dev/null || true)
+  done
+
+  if ((${#collected[@]} > 0)); then
+    printf '%s\n' "${collected[@]}"
+  fi
+}
+
+migrate_detect_running() {
+  local path="$1"
+  local svc_name status_out
+
+  echo "==> Checking legacy runner status"
+
+  if grep -q launchctl "${path}/svc.sh" 2>/dev/null; then
+    svc_name="$(migrate_svc_name "$path")"
+    if [[ -n "$svc_name" ]]; then
+      status_out="$(launchctl list 2>/dev/null | grep -F "$svc_name" || true)"
+      if [[ -n "$status_out" ]]; then
+        echo "  launchctl: running (${svc_name})"
+        echo "    ${status_out}"
+      else
+        echo "  launchctl: not loaded (${svc_name})"
+      fi
+    fi
+  elif grep -q systemctl "${path}/svc.sh" 2>/dev/null; then
+    svc_name="$(migrate_svc_name "$path")"
+    if [[ -n "$svc_name" ]] && command -v systemctl >/dev/null 2>&1; then
+      if systemctl is-active --quiet "$svc_name" 2>/dev/null; then
+        echo "  systemctl: active (${svc_name})"
+      else
+        echo "  systemctl: inactive (${svc_name})"
+      fi
+    fi
+    (cd "$path" && ./svc.sh status) 2>/dev/null || true
+  fi
+
+  local pid
+  if read -r pid < <(migrate_collect_pids "$path" | head -1); then
+    echo "  processes:"
+    while read -r pid; do
+      [[ -n "$pid" ]] && echo "    pid ${pid}: $(ps -p "$pid" -o command= 2>/dev/null || echo '?')"
+    done < <(migrate_collect_pids "$path")
+  else
+    echo "  processes: none matched"
+  fi
+}
+
+migrate_signal_pids() {
+  local sig="$1"
+  shift
+  local pid
+  for pid in "$@"; do
+    kill "-${sig}" "$pid" 2>/dev/null || true
+  done
+}
+
+migrate_stop() {
+  local path="$1"
+  local -a pids=()
+  local pid waited=0
+
+  echo "==> Stopping legacy runner"
+
+  if [[ -f "${path}/.service" ]] && [[ -x "${path}/svc.sh" ]]; then
+    echo "  running svc.sh stop"
+    (cd "$path" && ./svc.sh stop) || true
+  fi
+
+  sleep 3
+
+  while read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(migrate_collect_pids "$path")
+
+  if ((${#pids[@]} > 0)); then
+    echo "  sending SIGTERM to ${#pids[@]} process(es)"
+    migrate_signal_pids TERM "${pids[@]}"
+    while ((waited < 10)); do
+      local -a remaining=()
+      for pid in "${pids[@]}"; do
+        kill -0 "$pid" 2>/dev/null && remaining+=("$pid")
+      done
+      ((${#remaining[@]} == 0)) && break
+      sleep 1
+      waited=$((waited + 1))
+      pids=("${remaining[@]}")
+    done
+    if ((${#pids[@]} > 0)); then
+      echo "  sending SIGKILL to ${#pids[@]} remaining process(es)"
+      migrate_signal_pids KILL "${pids[@]}"
+      sleep 1
+    fi
+  fi
+
+  if read -r pid < <(migrate_collect_pids "$path" | head -1); then
+    echo "warning: some legacy runner processes may still be running" >&2
+    migrate_detect_running "$path"
+  else
+    echo "  legacy runner stopped"
+  fi
+}
+
+parse_github_target() {
+  local url="$1"
+  GITHUB_TARGET_TYPE=""
+  GITHUB_OWNER=""
+  GITHUB_REPO_NAME=""
+
+  if [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/?$ ]]; then
+    GITHUB_TARGET_TYPE="repo"
+    GITHUB_OWNER="${BASH_REMATCH[1]}"
+    GITHUB_REPO_NAME="${BASH_REMATCH[2]}"
+  elif [[ "$url" =~ ^https://github\.com/([^/]+)/?$ ]]; then
+    GITHUB_TARGET_TYPE="org"
+    GITHUB_OWNER="${BASH_REMATCH[1]}"
+  else
+    GITHUB_TARGET_TYPE="unsupported"
+  fi
+}
+
+gh_fetch_registration_token() {
+  local token=""
+  case "$GITHUB_TARGET_TYPE" in
+    repo)
+      token="$(gh api -X POST "repos/${GITHUB_OWNER}/${GITHUB_REPO_NAME}/actions/runners/registration-token" --jq .token)"
+      ;;
+    org)
+      token="$(gh api -X POST "orgs/${GITHUB_OWNER}/actions/runners/registration-token" --jq .token)"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [[ -n "$token" && "$token" != "null" ]] || return 1
+  printf '%s' "$token"
+}
+
+gh_fetch_runner_labels() {
+  local agent_id="$1" agent_name="$2"
+  local api_path labels
+  case "$GITHUB_TARGET_TYPE" in
+    repo) api_path="repos/${GITHUB_OWNER}/${GITHUB_REPO_NAME}/actions/runners" ;;
+    org) api_path="orgs/${GITHUB_OWNER}/actions/runners" ;;
+    *) return 1 ;;
+  esac
+
+  labels="$(
+    gh api "$api_path" --paginate \
+      --jq "[.runners[]? | select(.id == ${agent_id} or .name == \"${agent_name}\") | .labels[]?.name] | unique | join(\",\")" 2>/dev/null || true
+  )"
+  [[ -n "$labels" && "$labels" != "null" ]] || return 1
+  printf '%s' "$labels"
+}
+
+read_legacy_runner_token() {
+  local env_file="$1/.env"
+  [[ -f "$env_file" ]] || return 1
+  local line val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^RUNNER_TOKEN=(.*)$ ]]; then
+      val="${BASH_REMATCH[1]}"
+      val="${val%\"}"
+      val="${val#\"}"
+      [[ -n "$val" ]] || return 1
+      printf '%s' "$val"
+      return 0
+    fi
+  done <"$env_file"
+  return 1
+}
+
+prompt_registration_token() {
+  local input
+  echo "Generate a registration token: GitHub → Settings → Actions → Runners → New self-hosted runner"
+  while true; do
+    read -r -s -p "RUNNER_TOKEN (required, hidden): " input
+    echo
+    [[ -n "$input" ]] && env_set "RUNNER_TOKEN" "$input" && return
+    echo "  RUNNER_TOKEN cannot be empty."
+  done
+}
+
+migrate_extract_config() {
+  local path="$1"
+  local runner_file="${path}/.runner"
+  local github_url agent_name agent_id labels token
+
+  echo "==> Reading legacy configuration"
+
+  github_url="$(jq -r '.gitHubUrl // empty' "$runner_file")"
+  agent_name="$(jq -r '.agentName // empty' "$runner_file")"
+  agent_id="$(jq -r '.agentId // empty' "$runner_file")"
+
+  [[ -n "$github_url" ]] || die "gitHubUrl missing in ${runner_file}"
+  [[ -n "$agent_name" ]] || die "agentName missing in ${runner_file}"
+
+  env_set "GITHUB_URL" "$github_url"
+  env_set "RUNNER_NAME" "$agent_name"
+
+  parse_github_target "$github_url"
+
+  token=""
+  if gh_auth_ok && [[ "$GITHUB_TARGET_TYPE" != "unsupported" ]]; then
+    echo "  fetching registration token via gh api"
+    if token="$(gh_fetch_registration_token)"; then
+      env_set "RUNNER_TOKEN" "$token"
+    else
+      echo "warning: gh api registration-token failed; will try legacy .env or prompt" >&2
+    fi
+  elif [[ "$GITHUB_TARGET_TYPE" == "unsupported" ]]; then
+    echo "warning: non-github.com URL — skipping gh api" >&2
+  fi
+
+  if ! env_get "RUNNER_TOKEN" >/dev/null 2>&1 || [[ -z "$(env_get RUNNER_TOKEN)" ]]; then
+    if token="$(read_legacy_runner_token "$path" 2>/dev/null || true)"; then
+      echo "  using RUNNER_TOKEN from legacy .env"
+      env_set "RUNNER_TOKEN" "$token"
+    else
+      prompt_registration_token
+    fi
+  fi
+
+  labels=""
+  if gh_auth_ok && [[ "$GITHUB_TARGET_TYPE" != "unsupported" ]] && [[ -n "$agent_id" ]]; then
+    echo "  fetching runner labels via gh api"
+    labels="$(gh_fetch_runner_labels "$agent_id" "$agent_name" 2>/dev/null || true)"
+  fi
+  if [[ -z "$labels" ]]; then
+    labels="$(env_get RUNNER_LABELS 2>/dev/null || true)"
+    read -r -p "RUNNER_LABELS [${labels}]: " input
+    if [[ -n "$input" ]]; then
+      labels="$input"
+    fi
+  fi
+  env_set "RUNNER_LABELS" "$(merge_docker_label "$labels")"
+
+  echo "  GITHUB_URL=${github_url}"
+  echo "  RUNNER_NAME=${agent_name}"
+  echo "  RUNNER_LABELS=$(env_get RUNNER_LABELS)"
+  echo "  RUNNER_TOKEN=***"
+}
+
+migrate_apply_env() {
+  local env_file="${INSTALL_DIR}/.env"
+  if [[ -f "$env_file" ]]; then
+    echo "==> Overwriting existing ${env_file} with migrated configuration"
+  fi
+  migrate_extract_config "$MIGRATE_SOURCE"
+  write_env_file
+}
+
+run_migration() {
+  migrate_validate
+  migrate_detect_running "$MIGRATE_SOURCE"
+  migrate_stop "$MIGRATE_SOURCE"
+}
+
 configure_env() {
   parse_env_example
+
+  if [[ -n "$MIGRATE_SOURCE" ]]; then
+    migrate_apply_env
+    return 0
+  fi
+
   local env_file="${INSTALL_DIR}/.env"
 
   if [[ -f "$env_file" ]]; then
@@ -214,6 +638,7 @@ configure_env() {
     echo ".env already exists."
     while true; do
       PS3="Choose: "
+      # shellcheck disable=SC2034
       select action in "Keep existing .env" "Overwrite (re-prompt all)" "Edit selected keys"; do
         case "$REPLY" in
           1)
@@ -256,6 +681,14 @@ print_summary() {
 ==> Installation complete
 
 Directory: ${INSTALL_DIR}
+EOF
+  if [[ -n "$MIGRATE_SOURCE" ]]; then
+    cat <<EOF
+Migrated from: ${MIGRATE_SOURCE}
+Legacy runner service was stopped before starting the Docker stack.
+EOF
+  fi
+  cat <<EOF
 
 Manage the stack:
   cd ${INSTALL_DIR}
@@ -270,6 +703,9 @@ EOF
 
 main() {
   preflight
+  if [[ -n "$MIGRATE_PATH" ]]; then
+    run_migration
+  fi
   mkdir -p "$INSTALL_DIR"
   cd "$INSTALL_DIR"
   download_runtime_files
@@ -278,4 +714,5 @@ main() {
   print_summary
 }
 
-main "$@"
+parse_args "$@"
+main

@@ -1,6 +1,6 @@
 # build: image toolchain (env.build + docker-compose.build.yml)
 # up:    production stack (.env only, no local build)
-.PHONY: build push up down logs
+.PHONY: build push up down logs lint
 
 build:
 	./scripts/build.sh
@@ -16,3 +16,6 @@ down:
 
 logs:
 	./manage.sh logs
+
+lint:
+	./scripts/lint.sh

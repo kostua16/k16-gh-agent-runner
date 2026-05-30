@@ -97,6 +97,7 @@ menu_loop() {
   while true; do
     echo
     PS3="Choose an action: "
+    # shellcheck disable=SC2034
     select choice in "Up" "Down" "Logs" "Status" "Restart" "Pull" "Quit"; do
       case "$REPLY" in
         1)

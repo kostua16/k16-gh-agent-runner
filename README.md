@@ -100,6 +100,29 @@ From a git clone:
 ./install.sh
 ```
 
+### Migrate from an existing self-hosted runner
+
+If you already have a classic [`actions-runner`](https://github.com/actions/runner) install (for example `~/actions-runner` with `svc.sh` and `.runner`):
+
+```bash
+./install.sh --migrate
+# or
+./install.sh --migrate ~/actions-runner
+```
+
+This will:
+
+1. Verify the legacy directory (`.runner`, `svc.sh`)
+2. Stop the legacy service (`svc.sh stop`) and terminate listener processes (SIGTERM, then SIGKILL if needed)
+3. Import `GITHUB_URL` and `RUNNER_NAME` from `.runner`
+4. Obtain a new `RUNNER_TOKEN` via `gh api` when `gh auth login` is active; otherwise read legacy `.env` or prompt
+5. Fetch `RUNNER_LABELS` from GitHub when possible (adds `docker` if missing)
+6. Write `~/k16-gh-agent-runner/.env` and start the Docker stack
+
+Requires **jq** for `--migrate`. **gh** is optional but recommended for automatic token and labels.
+
+Operator scripts (`install.sh`, `manage.sh`) run on **macOS default bash 3.2** (`/bin/bash`).
+
 ## Managing the stack
 
 ```bash
@@ -152,6 +175,12 @@ make build
 
 - Uses [`env.build`](env.build) for version pins and [`docker-compose.build.yml`](docker-compose.build.yml) for the build overlay.
 - Override versions via environment variables or by editing `env.build`.
+
+Lint shell scripts (requires [shellcheck](https://www.shellcheck.net/)):
+
+```bash
+make lint
+```
 
 Push to GHCR (requires `gh auth login`):
 
