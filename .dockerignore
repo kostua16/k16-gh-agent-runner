@@ -1,9 +1,11 @@
 .env
 .env.*
 !.env.example
+!env.build
 .git
 .gitignore
-scripts/
+scripts/*
+!scripts/install-toolchain.sh
 Makefile
 *.md
 .cursor

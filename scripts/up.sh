@@ -9,4 +9,4 @@ if [[ ! -f .env ]]; then
   echo "Created .env from .env.example — set GITHUB_URL and RUNNER_TOKEN before starting."
 fi
 
-docker compose up -d --build
+docker compose up -d

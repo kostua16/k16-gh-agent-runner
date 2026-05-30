@@ -1,6 +1,47 @@
 FROM ghcr.io/falcondev-oss/actions-runner:latest
 
+# --- toolchain versions (defaults match amnezia-control-panel) ---
+ARG NODE_MAJOR=22
+ARG BUN_VERSION=1.3.14
+ARG GH_VERSION=2.93.0
+ARG GSD_VERSION=1.1.0
+ARG RTK_VERSION=0.35.0
+ARG RTK_INSTALL_SHA256=9989e60e33a353e9e6802fab1fd410b96d1dd228b34e52402c32f3c8c2dd8c66
+ARG PRISMA_VERSION=latest
+ARG ACTIONLINT_VERSION=1.7.7
+ARG CLAUDE_CODE_VERSION=latest
+ARG CODEX_VERSION=latest
+
+ARG INSTALL_RTK=true
+ARG INSTALL_GSD=true
+ARG INSTALL_PRISMA=true
+ARG INSTALL_ACTIONLINT=true
+ARG INSTALL_CLAUDE_CODE=true
+ARG INSTALL_CODEX=true
+ARG INSTALL_CURSOR_AGENT=true
+
+ENV NODE_MAJOR=${NODE_MAJOR} \
+    BUN_VERSION=${BUN_VERSION} \
+    GH_VERSION=${GH_VERSION} \
+    GSD_VERSION=${GSD_VERSION} \
+    RTK_VERSION=${RTK_VERSION} \
+    RTK_INSTALL_SHA256=${RTK_INSTALL_SHA256} \
+    PRISMA_VERSION=${PRISMA_VERSION} \
+    ACTIONLINT_VERSION=${ACTIONLINT_VERSION} \
+    CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION} \
+    CODEX_VERSION=${CODEX_VERSION} \
+    INSTALL_RTK=${INSTALL_RTK} \
+    INSTALL_GSD=${INSTALL_GSD} \
+    INSTALL_PRISMA=${INSTALL_PRISMA} \
+    INSTALL_ACTIONLINT=${INSTALL_ACTIONLINT} \
+    INSTALL_CLAUDE_CODE=${INSTALL_CLAUDE_CODE} \
+    INSTALL_CODEX=${INSTALL_CODEX} \
+    INSTALL_CURSOR_AGENT=${INSTALL_CURSOR_AGENT} \
+    PATH="/home/runner/.local/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 USER root
+COPY scripts/install-toolchain.sh /tmp/install-toolchain.sh
+RUN chmod +x /tmp/install-toolchain.sh && /tmp/install-toolchain.sh
 COPY runner.sh /runner.sh
 RUN chmod +x /runner.sh
 USER runner

@@ -43,3 +43,21 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NODE_MAJOR=22
+            BUN_VERSION=1.3.14
+            GH_VERSION=2.93.0
+            GSD_VERSION=1.1.0
+            RTK_VERSION=0.35.0
+            RTK_INSTALL_SHA256=9989e60e33a353e9e6802fab1fd410b96d1dd228b34e52402c32f3c8c2dd8c66
+            PRISMA_VERSION=latest
+            ACTIONLINT_VERSION=1.7.7
+            CLAUDE_CODE_VERSION=latest
+            CODEX_VERSION=latest
+            INSTALL_RTK=true
+            INSTALL_GSD=true
+            INSTALL_PRISMA=true
+            INSTALL_ACTIONLINT=true
+            INSTALL_CLAUDE_CODE=true
+            INSTALL_CODEX=true
+            INSTALL_CURSOR_AGENT=true
