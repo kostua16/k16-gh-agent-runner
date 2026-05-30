@@ -89,6 +89,7 @@ Pass options after `bash -s --` (same script, no local checkout):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --help
+curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --token "$RUNNER_TOKEN"
 ```
 
 This will:
@@ -106,8 +107,8 @@ If you already have a classic [`actions-runner`](https://github.com/actions/runn
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --migrate
-# or with a custom legacy path:
-curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --migrate ~/actions-runner
+# or with a custom legacy path and token:
+curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --migrate ~/actions-runner --token "$RUNNER_TOKEN"
 ```
 
 This will:
@@ -119,7 +120,9 @@ This will:
 5. Fetch `RUNNER_LABELS` from GitHub when possible (adds `docker` if missing)
 6. Write `~/k16-gh-agent-runner/.env` and start the Docker stack
 
-Requires **jq** for `--migrate`. **gh** is optional but recommended for automatic token and labels.
+Requires **jq** for `--migrate`. **gh** is strongly recommended (`gh auth login`) so the script can fetch a fresh registration token and runner labels. Without `gh`, pass `--token` or export `RUNNER_TOKEN` (legacy `.env` tokens are often empty or expired).
+
+When piped via `curl | bash`, prompts read from `/dev/tty` when available; labels default to `self-hosted,<OS>,<ARCH>,docker` if `gh` cannot fetch them.
 
 Operator scripts (`install.sh`, `manage.sh`) run on **macOS default bash 3.2** (`/bin/bash`).
 

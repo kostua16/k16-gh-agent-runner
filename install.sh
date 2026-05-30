@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bootstrap ~/k16-gh-agent-runner and start the runner stack.
 # One-liner: curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash
-# Migrate:   ./install.sh --migrate [~/actions-runner]
+# Migrate:   curl -fsSL .../install.sh | bash -s -- --migrate [~/actions-runner]
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/k16-gh-agent-runner}"
@@ -11,6 +11,7 @@ RAW_BASE="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}"
 
 MIGRATE_PATH=""
 MIGRATE_SOURCE=""
+CLI_TOKEN=""
 
 ENV_KEYS=()
 ENV_VALS=()
@@ -48,6 +49,48 @@ env_set() {
   ENV_VALS+=("$val")
 }
 
+prompt_fd() {
+  if [[ -r /dev/tty ]]; then
+    printf '/dev/tty'
+  elif [[ -t 0 ]]; then
+    printf '0'
+  else
+    return 1
+  fi
+}
+
+read_line() {
+  local prompt="$1" secret="${2:-0}" fd reply=""
+  fd="$(prompt_fd)" || return 1
+  if [[ "$secret" == 1 ]]; then
+    read -r -s -p "$prompt" reply <"$fd"
+    echo
+  else
+    read -r -p "$prompt" reply <"$fd"
+  fi
+  printf '%s' "$reply"
+}
+
+apply_supplied_token() {
+  if [[ -n "$CLI_TOKEN" ]]; then
+    echo "  using RUNNER_TOKEN from --token"
+    env_set "RUNNER_TOKEN" "$CLI_TOKEN"
+    return 0
+  fi
+  if [[ -n "${RUNNER_TOKEN:-}" ]]; then
+    echo "  using RUNNER_TOKEN from environment"
+    env_set "RUNNER_TOKEN" "$RUNNER_TOKEN"
+    return 0
+  fi
+  return 1
+}
+
+runner_token_set() {
+  local token
+  token="$(env_get RUNNER_TOKEN 2>/dev/null || true)"
+  [[ -n "$token" ]]
+}
+
 die() {
   echo "error: $*" >&2
   exit 1
@@ -62,18 +105,21 @@ Options:
                     (default PATH: ~/actions-runner). Requires jq.
                     Stops the old service, imports URL/name/labels, and
                     prefers `gh api` for a new registration token.
+  --token TOKEN     Runner registration token (skips token prompt and
+                    overrides gh/legacy token lookup in --migrate)
   -h, --help        Show this help
 
 Environment:
   INSTALL_DIR       Target directory (default: ~/k16-gh-agent-runner)
   GITHUB_REPO       Source repo for runtime files
   GITHUB_BRANCH     Branch to download (default: main)
+  RUNNER_TOKEN      Same as --token (CLI flag takes precedence)
 
 Examples:
   curl -fsSL .../install.sh | bash
-  ./install.sh
-  ./install.sh --migrate
-  ./install.sh --migrate ~/actions-runner
+  curl -fsSL .../install.sh | bash -s -- --token "$RUNNER_TOKEN"
+  curl -fsSL .../install.sh | bash -s -- --migrate --token "$RUNNER_TOKEN"
+  ./install.sh --migrate ~/actions-runner --token "$RUNNER_TOKEN"
 EOF
 }
 
@@ -88,6 +134,17 @@ parse_args() {
           MIGRATE_PATH="${HOME}/actions-runner"
           shift
         fi
+        ;;
+      --token)
+        [[ $# -ge 2 ]] || die "--token requires a value"
+        CLI_TOKEN="$2"
+        [[ -n "$CLI_TOKEN" ]] || die "--token value cannot be empty"
+        shift 2
+        ;;
+      --token=*)
+        CLI_TOKEN="${1#--token=}"
+        [[ -n "$CLI_TOKEN" ]] || die "--token value cannot be empty"
+        shift
         ;;
       -h | --help)
         usage
@@ -201,9 +258,11 @@ prompt_key() {
   default="$(env_get "$key" 2>/dev/null || true)"
 
   if [[ "$key" == "RUNNER_TOKEN" ]]; then
+    if runner_token_set; then
+      return 0
+    fi
     while true; do
-      read -r -s -p "${key} (required, hidden): " input
-      echo
+      input="$(read_line "${key} (required, hidden): " 1)" || die "RUNNER_TOKEN required (stdin is not a TTY; use --token, export RUNNER_TOKEN, or use a terminal)"
       if [[ -n "$input" ]]; then
         env_set "$key" "$input"
         return
@@ -213,7 +272,7 @@ prompt_key() {
   fi
 
   if is_bool_key "$key"; then
-    read -r -p "${key} [${default}] (true/false): " input
+    input="$(read_line "${key} [${default}] (true/false): ")"
     if [[ -z "$input" ]]; then
       env_set "$key" "$(normalize_bool "$default")"
     else
@@ -223,9 +282,9 @@ prompt_key() {
   fi
 
   if [[ -n "$default" ]]; then
-    read -r -p "${key} [${default}]: " input
+    input="$(read_line "${key} [${default}]: ")"
   else
-    read -r -p "${key}: " input
+    input="$(read_line "${key}: ")"
   fi
   if [[ -z "$input" ]]; then
     env_set "$key" "$default"
@@ -252,14 +311,13 @@ write_env_file() {
 
 prompt_optional_api_keys() {
   local add add_lower
-  read -r -p "Add optional workflow API keys? (y/N): " add
+  add="$(read_line "Add optional workflow API keys? (y/N): ")" || return 0
   add_lower="$(tolower "$add")"
   [[ "$add_lower" == "y" || "$add_lower" == "yes" ]] || return 0
 
   local key val
   for key in "${OPTIONAL_API_KEYS[@]}"; do
-    read -r -s -p "${key} (optional, hidden): " val
-    echo
+    val="$(read_line "${key} (optional, hidden): " 1)" || break
     if [[ -n "$val" ]]; then
       echo "${key}=${val}" >>"${INSTALL_DIR}/.env"
     fi
@@ -281,7 +339,7 @@ edit_env_interactive() {
       ((i++)) || true
     done
     echo "  0) Done"
-    read -r -p "Edit key number (0=done): " choice
+    choice="$(read_line "Edit key number (0=done): ")"
     [[ "$choice" == "0" ]] && break
     if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#ENV_KEYS[@]})); then
       prompt_key "${ENV_KEYS[$((choice - 1))]}"
@@ -350,6 +408,36 @@ migrate_svc_name() {
   printf '%s' "$line"
 }
 
+migrate_run_svc() {
+  local path="$1" action="$2"
+  local out rc=0
+
+  out="$(cd "$path" && ./svc.sh "$action" 2>&1)" || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
+  fi
+
+  printf '%s\n' "$out"
+  if grep -qi 'must run as sudo' <<<"$out" && command -v sudo >/dev/null 2>&1; then
+    echo "  retrying svc.sh ${action} with sudo"
+    (cd "$path" && sudo ./svc.sh "$action") || true
+  fi
+}
+
+migrate_default_labels() {
+  local labels="self-hosted"
+  case "$(uname -s)" in
+    Linux) labels+=",Linux" ;;
+    Darwin) labels+=",macOS" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64 | amd64) labels+=",X64" ;;
+    aarch64 | arm64) labels+=",ARM64" ;;
+  esac
+  printf '%s' "$labels"
+}
+
 migrate_collect_pids() {
   local path="$1"
   local -a collected=()
@@ -399,7 +487,7 @@ migrate_detect_running() {
         echo "  systemctl: inactive (${svc_name})"
       fi
     fi
-    (cd "$path" && ./svc.sh status) 2>/dev/null || true
+    migrate_run_svc "$path" status
   fi
 
   local pid
@@ -431,7 +519,7 @@ migrate_stop() {
 
   if [[ -f "${path}/.service" ]] && [[ -x "${path}/svc.sh" ]]; then
     echo "  running svc.sh stop"
-    (cd "$path" && ./svc.sh stop) || true
+    migrate_run_svc "$path" stop
   fi
 
   sleep 3
@@ -541,8 +629,7 @@ prompt_registration_token() {
   local input
   echo "Generate a registration token: GitHub → Settings → Actions → Runners → New self-hosted runner"
   while true; do
-    read -r -s -p "RUNNER_TOKEN (required, hidden): " input
-    echo
+    input="$(read_line "RUNNER_TOKEN (required, hidden): " 1)" || die "RUNNER_TOKEN required (stdin is not a TTY; use --token, export RUNNER_TOKEN, or install gh and run gh auth login)"
     [[ -n "$input" ]] && env_set "RUNNER_TOKEN" "$input" && return
     echo "  RUNNER_TOKEN cannot be empty."
   done
@@ -567,24 +654,30 @@ migrate_extract_config() {
 
   parse_github_target "$github_url"
 
-  token=""
-  if gh_auth_ok && [[ "$GITHUB_TARGET_TYPE" != "unsupported" ]]; then
-    echo "  fetching registration token via gh api"
-    if token="$(gh_fetch_registration_token)"; then
-      env_set "RUNNER_TOKEN" "$token"
-    else
-      echo "warning: gh api registration-token failed; will try legacy .env or prompt" >&2
+  if ! apply_supplied_token; then
+    token=""
+    if gh_auth_ok && [[ "$GITHUB_TARGET_TYPE" != "unsupported" ]]; then
+      echo "  fetching registration token via gh api"
+      if token="$(gh_fetch_registration_token)"; then
+        env_set "RUNNER_TOKEN" "$token"
+      else
+        echo "warning: gh api registration-token failed; will try legacy .env or prompt" >&2
+      fi
+    elif [[ "$GITHUB_TARGET_TYPE" == "unsupported" ]]; then
+      echo "warning: non-github.com URL — skipping gh api" >&2
     fi
-  elif [[ "$GITHUB_TARGET_TYPE" == "unsupported" ]]; then
-    echo "warning: non-github.com URL — skipping gh api" >&2
-  fi
 
-  if ! env_get "RUNNER_TOKEN" >/dev/null 2>&1 || [[ -z "$(env_get RUNNER_TOKEN)" ]]; then
-    if token="$(read_legacy_runner_token "$path" 2>/dev/null || true)"; then
-      echo "  using RUNNER_TOKEN from legacy .env"
-      env_set "RUNNER_TOKEN" "$token"
-    else
-      prompt_registration_token
+    if ! runner_token_set; then
+      if token="$(read_legacy_runner_token "$path" 2>/dev/null)"; then
+        echo "  using RUNNER_TOKEN from legacy .env"
+        echo "warning: legacy registration tokens expire quickly; install gh and run gh auth login for a fresh token" >&2
+        env_set "RUNNER_TOKEN" "$token"
+      else
+        if ! command -v gh >/dev/null 2>&1; then
+          echo "warning: gh is not installed — cannot fetch a registration token automatically" >&2
+        fi
+        prompt_registration_token
+      fi
     fi
   fi
 
@@ -594,10 +687,20 @@ migrate_extract_config() {
     labels="$(gh_fetch_runner_labels "$agent_id" "$agent_name" 2>/dev/null || true)"
   fi
   if [[ -z "$labels" ]]; then
-    labels="$(env_get RUNNER_LABELS 2>/dev/null || true)"
-    read -r -p "RUNNER_LABELS [${labels}]: " input
+    if [[ -n "${RUNNER_LABELS:-}" ]]; then
+      labels="$RUNNER_LABELS"
+      echo "  using RUNNER_LABELS from environment"
+    else
+      labels="$(env_get RUNNER_LABELS 2>/dev/null || true)"
+    fi
+    if [[ -z "$labels" ]]; then
+      labels="$(migrate_default_labels)"
+    fi
+    input="$(read_line "RUNNER_LABELS [${labels}]: ")" || true
     if [[ -n "$input" ]]; then
       labels="$input"
+    elif ! prompt_fd >/dev/null 2>&1; then
+      echo "  using default RUNNER_LABELS=${labels} (non-interactive; edit .env to change)"
     fi
   fi
   env_set "RUNNER_LABELS" "$(merge_docker_label "$labels")"
@@ -608,12 +711,17 @@ migrate_extract_config() {
   echo "  RUNNER_TOKEN=***"
 }
 
+require_runner_token() {
+  runner_token_set || die "RUNNER_TOKEN is empty; pass --token, export RUNNER_TOKEN, install gh and run gh auth login, or re-run from a terminal to enter it"
+}
+
 migrate_apply_env() {
   local env_file="${INSTALL_DIR}/.env"
   if [[ -f "$env_file" ]]; then
     echo "==> Overwriting existing ${env_file} with migrated configuration"
   fi
   migrate_extract_config "$MIGRATE_SOURCE"
+  require_runner_token
   write_env_file
 }
 
@@ -625,6 +733,7 @@ run_migration() {
 
 configure_env() {
   parse_env_example
+  apply_supplied_token || true
 
   if [[ -n "$MIGRATE_SOURCE" ]]; then
     migrate_apply_env
@@ -671,6 +780,7 @@ configure_env() {
 }
 
 start_stack() {
+  require_runner_token
   echo "==> Starting stack"
   (cd "$INSTALL_DIR" && ./manage.sh up)
 }
