@@ -54,6 +54,8 @@ jobs:
             ACTIONLINT_VERSION=1.7.7
             CLAUDE_CODE_VERSION=latest
             CODEX_VERSION=latest
+            GEMINI_CLI_VERSION=latest
+            AI_TOOLS_CACHE_BUST=
             INSTALL_RTK=true
             INSTALL_GSD=true
             INSTALL_PRISMA=true
@@ -61,3 +63,5 @@ jobs:
             INSTALL_CLAUDE_CODE=true
             INSTALL_CODEX=true
             INSTALL_CURSOR_AGENT=true
+            INSTALL_GEMINI_CLI=true
+            INSTALL_ANTIGRAVITY_CLI=true
