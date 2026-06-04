@@ -907,7 +907,11 @@ check_runner_health() {
   local waits=5 id
   while ((waits > 0)); do
     sleep 2
-    id="$(cd "$INSTALL_DIR" && docker compose ps -q --status running runner 2>/dev/null || true)"
+    id="$(
+      if cd "$INSTALL_DIR"; then
+        docker compose ps -q --status running runner 2>/dev/null || true
+      fi
+    )"
     if [[ -n "$id" ]]; then
       return 0
     fi

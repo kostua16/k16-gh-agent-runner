@@ -53,7 +53,7 @@ flowchart TB
 
 ## What's in the image
 
-Versions are pinned in [`env.build`](env.build) and installed by [`scripts/install-toolchain.sh`](scripts/install-toolchain.sh).
+Versions are pinned in [`env.build`](env.build) and installed by phased scripts under [`scripts/`](scripts).
 
 | Category | Tools (defaults) |
 |----------|------------------|
@@ -64,10 +64,10 @@ Versions are pinned in [`env.build`](env.build) and installed by [`scripts/insta
 | Containers | Docker CLI 28.x + Compose v2 plugin (installed if missing from base) |
 | Archives | unzip, **xz-utils**, **zstd** |
 | Security / lint | **hadolint**, **gitleaks** |
-| AI agents (optional `INSTALL_*` build args) | GSD, RTK, OpenAI Codex CLI, Claude Code, Cursor Agent CLI |
+| AI agents (optional `INSTALL_*` build args) | GSD, RTK, OpenAI Codex CLI, Claude Code, Cursor Agent CLI, Gemini CLI, Antigravity CLI |
 | Data | Prisma CLI |
 
-API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`, etc.) are **not** baked into the image. Set them in GitHub Actions secrets or optional entries in `.env` for local testing.
+API keys and account auth (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`, `GEMINI_API_KEY`, Google/Antigravity sign-in, etc.) are **not** baked into the image. Set them in GitHub Actions secrets or optional entries in `.env` for local testing.
 
 To build a slimmer image, set `INSTALL_*=false` in `env.build` before `make build`.
 
@@ -207,6 +207,8 @@ From a clone you can also run `./install.sh` locally (same behavior as the curl 
 
 - Uses [`env.build`](env.build) for version pins and [`docker-compose.build.yml`](docker-compose.build.yml) for the build overlay.
 - Override versions via environment variables or by editing `env.build`.
+- Docker layers are ordered from slow-changing system/runtime tooling to per-tool AI CLI layers, with `runner.sh` copied last.
+- To refresh `latest` AI CLI installs without reinstalling lower layers, run `AI_TOOLS_CACHE_BUST=$(date -u +%Y%m%d) make build`.
 
 Lint shell scripts (requires [shellcheck](https://www.shellcheck.net/)):
 
@@ -235,7 +237,7 @@ CI publishes the image on push to `main` and version tags via [`.github/workflow
 |------|---------|
 | `Dockerfile` | Runner image definition |
 | `runner.sh` | Runner entrypoint (register + run) |
-| `scripts/install-toolchain.sh` | Toolchain installer |
+| `scripts/install-*.sh` | Layered installers plus generic tool-install helpers (`install-toolchain.sh` remains a wrapper) |
 | `docker-compose.yml` | Production stack |
 | `docker-compose.build.yml` | Build overlay only |
 | `install.sh` | Bootstrap installer for end users |

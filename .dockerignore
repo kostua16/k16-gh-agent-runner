@@ -5,8 +5,9 @@
 .git
 .gitignore
 scripts/*
-!scripts/install-toolchain.sh
+!scripts/install-*.sh
 Makefile
 *.md
 .cursor
 .planning
+.serena
