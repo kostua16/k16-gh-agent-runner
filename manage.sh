@@ -342,11 +342,11 @@ diagnose_logs() {
   fi
 
   if [[ "$stale_token" == "1" ]]; then
-    print_issue "Stale, expired, or wrong-scope RUNNER_TOKEN" "$stale_token_line" 'Generate a fresh token for GITHUB_URL, then run ./manage.sh replace-token --token "$RUNNER_TOKEN".'
+    print_issue "Stale, expired, or wrong-scope RUNNER_TOKEN" "$stale_token_line" "Generate a fresh token for GITHUB_URL, then run ./manage.sh replace-token --token \"\$RUNNER_TOKEN\"."
     found=1
   fi
   if [[ "$missing_token" == "1" ]]; then
-    print_issue "Missing RUNNER_TOKEN" "$missing_token_line" 'Set RUNNER_TOKEN or run ./manage.sh replace-token --token "$RUNNER_TOKEN".'
+    print_issue "Missing RUNNER_TOKEN" "$missing_token_line" "Set RUNNER_TOKEN or run ./manage.sh replace-token --token \"\$RUNNER_TOKEN\"."
     found=1
   fi
   if [[ "$unauthorized" == "1" ]]; then
