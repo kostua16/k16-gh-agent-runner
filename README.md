@@ -148,9 +148,11 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 ./manage.sh up             # start
 ./manage.sh down           # stop
 ./manage.sh logs runner    # follow runner logs
+./manage.sh issues         # scan recent runner logs for known failures
 ./manage.sh ps             # status
 ./manage.sh restart
 ./manage.sh pull           # pull latest images
+./manage.sh replace-token --token "$RUNNER_TOKEN"
 ./manage.sh upgrade        # refresh files + restart stack
 ```
 
@@ -159,9 +161,11 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 | `up` | Start services (requires `.env`) |
 | `down` | Stop and remove containers |
 | `logs [service]` | Follow logs (`runner`, `cache-server`) |
+| `issues [service]` | Scan recent logs for stale tokens, auth failures, session conflicts, URL mismatches, and network errors |
 | `ps`, `status` | Container status |
 | `restart [service]` | Restart |
 | `pull` | Pull images |
+| `replace-token [--token TOKEN]` | Update `RUNNER_TOKEN`, clear persisted runner registration, and restart the runner |
 
 From a clone, `make up`, `make down`, and `make logs` delegate to `manage.sh`.
 
@@ -180,7 +184,13 @@ Copy [`.env.example`](.env.example) to `.env` or run the [install curl command](
 | `RUNNER_EPHEMERAL` | `true` for ephemeral runners |
 | `RUNNER_REMOVE_ON_EXIT` | `true` to deregister from GitHub on container stop (default: keep registration) |
 
-Runner registration state is stored in the **`runner-data` Docker volume** (mounted at `/config` in the container). After the first successful start, `down` → `up` reuses credentials and does not need a fresh `RUNNER_TOKEN`. To force re-registration, run `docker compose down -v` (or `./manage.sh down` then remove the `runner-data` volume) and provide a new token.
+Runner registration state is stored in the **`runner-data` Docker volume** (mounted at `/config` in the container). After the first successful start, `down` → `up` reuses credentials and does not need a fresh `RUNNER_TOKEN`. To force re-registration, generate a fresh GitHub runner registration token for the exact `GITHUB_URL`, then run:
+
+```bash
+./manage.sh replace-token --token "$RUNNER_TOKEN"
+```
+
+If runner logs show `404 (Not Found)` from `actions/runner-registration`, the registration token is usually expired, for the wrong repo/org, or paired with the wrong `GITHUB_URL`. Run `./manage.sh issues` to scan recent runner logs, or `./manage.sh issues --file runner.log` for a saved log.
 
 ### Session conflict after restart
 
