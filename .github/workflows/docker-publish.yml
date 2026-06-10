@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/docker-publish.yml"
+      - "Dockerfile"
+      - "runner.sh"
+      - "scripts/install-*.sh"
   workflow_dispatch:
 
 permissions:
@@ -43,6 +49,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
           build-args: |
             NODE_MAJOR=22
             BUN_VERSION=1.3.14
