@@ -139,7 +139,8 @@ Commands:
   restart [svc]                     Restart services
   pull                              Pull latest images
   disk [--top N]                    Diagnose Docker/containerd disk usage
-  cleanup <logs|docker|all> [...]   Dry-run or apply safe disk cleanup
+  cleanup <logs|docker|volumes|all> [...]
+                                    Dry-run or apply safe disk cleanup
   replace-token [--token TOKEN]     Replace RUNNER_TOKEN and re-register runner
   upgrade                           Refresh runtime files and restart (install.sh --update)
   menu                              Interactive menu (default when no args)
@@ -150,6 +151,7 @@ Examples:
   ./manage.sh logs runner
   ./manage.sh issues
   ./manage.sh disk --top 10
+  ./manage.sh cleanup volumes --dry-run
   ./manage.sh cleanup logs runner --dry-run
   ./manage.sh cleanup docker --dry-run
   ./manage.sh replace-token --token "$RUNNER_TOKEN"
@@ -293,11 +295,204 @@ print_runner_container_usage() {
   fi
 }
 
+env_file_value() {
+  local key="$1"
+  [[ -f .env ]] || return 1
+  awk -v key="$key" '
+    /^[[:space:]]*#/ { next }
+    {
+      eq = index($0, "=")
+      if (eq > 0 && substr($0, 1, eq - 1) == key) {
+        print substr($0, eq + 1)
+        exit
+      }
+    }
+  ' .env
+}
+
+compose_project_name() {
+  local name="${COMPOSE_PROJECT_NAME:-}"
+  if [[ -z "$name" ]]; then
+    name="$(env_file_value COMPOSE_PROJECT_NAME 2>/dev/null || true)"
+  fi
+  if [[ -z "$name" ]]; then
+    name="$(basename "$ROOT")"
+  fi
+  printf '%s' "$name"
+}
+
+compose_declared_volumes() {
+  local volumes
+  volumes="$("${COMPOSE[@]}" config --volumes 2>/dev/null || true)"
+  if [[ -n "$volumes" ]]; then
+    printf '%s\n' "$volumes"
+  else
+    printf '%s\n' cache-data runner-data
+  fi
+}
+
+compose_volume_names() {
+  local project logical ids cid
+  project="$(compose_project_name)"
+
+  {
+    while IFS= read -r logical; do
+      [[ -n "$logical" ]] || continue
+      docker volume ls -q \
+        --filter "label=com.docker.compose.project=${project}" \
+        --filter "label=com.docker.compose.volume=${logical}" 2>/dev/null || true
+
+      if docker volume inspect "${project}_${logical}" >/dev/null 2>&1; then
+        printf '%s\n' "${project}_${logical}"
+      fi
+      if docker volume inspect "$logical" >/dev/null 2>&1; then
+        printf '%s\n' "$logical"
+      fi
+    done <<<"$(compose_declared_volumes)"
+
+    ids="$("${COMPOSE[@]}" ps -a -q 2>/dev/null || true)"
+    while IFS= read -r cid; do
+      [[ -n "$cid" ]] || continue
+      docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' "$cid" 2>/dev/null || true
+    done <<<"$ids"
+  } | awk 'NF && !seen[$0]++'
+}
+
+volume_label() {
+  local volume="$1" key="$2" value
+  value="$(docker volume inspect -f "{{ index .Labels \"${key}\" }}" "$volume" 2>/dev/null || true)"
+  clean_template_value "$value"
+}
+
+volume_mountpoint() {
+  local volume="$1" mountpoint
+  mountpoint="$(docker volume inspect -f '{{.Mountpoint}}' "$volume" 2>/dev/null || true)"
+  clean_template_value "$mountpoint"
+}
+
+volume_logical_name() {
+  local volume="$1" logical
+  logical="$(volume_label "$volume" "com.docker.compose.volume")"
+  if [[ -z "$logical" ]]; then
+    case "$volume" in
+      *_cache-data) logical="cache-data" ;;
+      *_runner-data) logical="runner-data" ;;
+      *) logical="$volume" ;;
+    esac
+  fi
+  printf '%s' "$logical"
+}
+
+find_compose_volume() {
+  local logical="$1" volumes volume
+  volumes="$(compose_volume_names)"
+  while IFS= read -r volume; do
+    [[ -n "$volume" ]] || continue
+    if [[ "$(volume_logical_name "$volume")" == "$logical" ]]; then
+      printf '%s\n' "$volume"
+      return 0
+    fi
+  done <<<"$volumes"
+  return 1
+}
+
+safe_volume_mountpoint() {
+  case "$1" in
+    "" | "/" | "/var" | "/var/lib" | "/var/lib/docker" | "/var/lib/docker/volumes") return 1 ;;
+    */_data) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+print_runner_volume_candidates() {
+  local mountpoint="$1" found
+  echo "    expected runner-data files: .runner, .credentials, .credentials_rsaparams"
+  if [[ ! -d "$mountpoint" ]]; then
+    return 0
+  fi
+
+  found="$(find "$mountpoint" -mindepth 1 -maxdepth 1 \
+    ! -name .runner \
+    ! -name .credentials \
+    ! -name .credentials_rsaparams \
+    -print -quit 2>/dev/null || true)"
+  if [[ -z "$found" ]]; then
+    echo "    cleanup candidates: none"
+    return 0
+  fi
+
+  echo "    cleanup candidates (non-registration top-level entries):"
+  find "$mountpoint" -mindepth 1 -maxdepth 1 \
+    ! -name .runner \
+    ! -name .credentials \
+    ! -name .credentials_rsaparams \
+    -exec du -sh {} + 2>/dev/null | sort -h | sed 's/^/      /' || true
+}
+
+print_cache_volume_candidates() {
+  local mountpoint="$1" path found=0
+  if [[ ! -d "$mountpoint" ]]; then
+    return 0
+  fi
+
+  echo "    cache cleanup candidates:"
+  for path in \
+    "${mountpoint}/cache" \
+    "${mountpoint}/cache-server.db" \
+    "${mountpoint}/cache-server.db-shm" \
+    "${mountpoint}/cache-server.db-wal"; do
+    if [[ -e "$path" ]]; then
+      echo "      $(path_usage "$path")  ${path}"
+      found=1
+    fi
+  done
+  if [[ "$found" == "0" ]]; then
+    echo "      none"
+  fi
+}
+
+print_compose_volumes() {
+  local top="$1" volumes volume logical project mountpoint
+
+  section "Compose Volumes"
+  volumes="$(compose_volume_names)"
+  if [[ -z "$volumes" ]]; then
+    echo "  no compose volumes found"
+    return 0
+  fi
+
+  while IFS= read -r volume; do
+    [[ -n "$volume" ]] || continue
+    logical="$(volume_logical_name "$volume")"
+    project="$(volume_label "$volume" "com.docker.compose.project")"
+    mountpoint="$(volume_mountpoint "$volume")"
+
+    echo "  ${volume}"
+    [[ -n "$project" ]] && echo "    project: ${project}"
+    echo "    logical: ${logical}"
+    if [[ -n "$mountpoint" ]]; then
+      echo "    mountpoint: ${mountpoint} ($(path_usage "$mountpoint"))"
+      if [[ -d "$mountpoint" ]]; then
+        echo "    top contents:"
+        disk_usage "$mountpoint" "$top" top | sed 's/^/      /'
+      fi
+    else
+      echo "    mountpoint: unavailable"
+    fi
+
+    case "$logical" in
+      runner-data) print_runner_volume_candidates "$mountpoint" ;;
+      cache-data) print_cache_volume_candidates "$mountpoint" ;;
+    esac
+  done <<<"$volumes"
+}
+
 disk_usage_usage() {
   cat <<'EOF'
 Usage: manage.sh disk [--top N]
 
-Shows Docker/containerd disk diagnostics without deleting anything.
+Shows Docker/containerd disk and compose volume diagnostics without deleting
+anything.
 
 Options:
   --top N   Number of largest entries to show for ranked lists (default: 10)
@@ -338,6 +533,7 @@ cmd_disk() {
   docker ps -a --size || true
 
   print_stack_container_disk
+  print_compose_volumes "$top"
   print_top_json_logs "$top"
 
   section "/var/lib/docker Usage"
@@ -358,7 +554,7 @@ cmd_upgrade() {
 
 cleanup_usage() {
   cat <<'EOF'
-Usage: manage.sh cleanup <logs|docker|all> [options]
+Usage: manage.sh cleanup <logs|docker|volumes|all> [options]
 
 Safe cleanup tools default to --dry-run. Use --apply to delete or truncate.
 
@@ -369,8 +565,12 @@ Commands:
   cleanup docker [--dry-run|--apply] [--until 168h] [--all-images]
       Prune stopped containers, images, and build cache. Volumes are never pruned.
 
+  cleanup volumes [cache|runner-data|--all] [--dry-run|--apply]
+      Inspect or clean compose volumes. --apply requires an explicit target.
+
   cleanup all [--dry-run|--apply] [--until 168h] [--all-images]
-      Run log cleanup for all compose services, then Docker cleanup.
+      Run log cleanup for all compose services, then Docker cleanup. Volume
+      cleanup is intentionally separate.
 EOF
 }
 
@@ -553,6 +753,157 @@ cmd_cleanup_docker() {
   echo "  volumes were not pruned"
 }
 
+print_cache_volume_cleanup_plan() {
+  local volume="$1" mountpoint="$2"
+  echo "  volume: ${volume}"
+  echo "  will remove cache-server cache files and sqlite database state"
+  if [[ -n "$mountpoint" ]]; then
+    print_cache_volume_candidates "$mountpoint"
+  fi
+  echo "  cache-server will be stopped before cleanup and started afterwards"
+}
+
+cmd_cleanup_volume_cache() {
+  local mode="$1" volume mountpoint
+  volume="$(find_compose_volume cache-data 2>/dev/null || true)"
+  section "cache-data Volume Cleanup (${mode})"
+  if [[ -z "$volume" ]]; then
+    echo "  cache-data volume not found"
+    return 0
+  fi
+
+  mountpoint="$(volume_mountpoint "$volume")"
+  if [[ "$mode" == "dry-run" ]]; then
+    print_cache_volume_cleanup_plan "$volume" "$mountpoint"
+    echo "  dry-run only; re-run with --apply to clear cache-data"
+    return 0
+  fi
+
+  if ! safe_volume_mountpoint "$mountpoint"; then
+    die "unsafe or unavailable cache-data mountpoint: ${mountpoint:-<empty>}"
+  fi
+
+  echo "  stopping cache-server"
+  "${COMPOSE[@]}" stop --timeout 30 cache-server 2>/dev/null || true
+
+  echo "  clearing ${volume} cache data"
+  rm -rf \
+    "${mountpoint}/cache" \
+    "${mountpoint}/cache-server.db" \
+    "${mountpoint}/cache-server.db-shm" \
+    "${mountpoint}/cache-server.db-wal"
+  mkdir -p "${mountpoint}/cache"
+
+  echo "  starting cache-server"
+  "${COMPOSE[@]}" up -d cache-server
+}
+
+print_runner_legacy_cleanup_plan() {
+  local volume="$1" mountpoint="$2"
+  echo "  volume: ${volume}"
+  echo "  will preserve .runner, .credentials, and .credentials_rsaparams"
+  if [[ -n "$mountpoint" ]]; then
+    print_runner_volume_candidates "$mountpoint"
+  fi
+}
+
+cmd_cleanup_volume_runner_legacy() {
+  local mode="$1" volume mountpoint found
+  volume="$(find_compose_volume runner-data 2>/dev/null || true)"
+  section "runner-data Legacy Cleanup (${mode})"
+  if [[ -z "$volume" ]]; then
+    echo "  runner-data volume not found"
+    return 0
+  fi
+
+  mountpoint="$(volume_mountpoint "$volume")"
+  if [[ "$mode" == "dry-run" ]]; then
+    print_runner_legacy_cleanup_plan "$volume" "$mountpoint"
+    echo "  dry-run only; re-run with --apply to remove non-registration entries"
+    return 0
+  fi
+
+  if ! safe_volume_mountpoint "$mountpoint"; then
+    die "unsafe or unavailable runner-data mountpoint: ${mountpoint:-<empty>}"
+  fi
+
+  found="$(find "$mountpoint" -mindepth 1 -maxdepth 1 \
+    ! -name .runner \
+    ! -name .credentials \
+    ! -name .credentials_rsaparams \
+    -print -quit 2>/dev/null || true)"
+  if [[ -z "$found" ]]; then
+    echo "  no non-registration entries found"
+    return 0
+  fi
+
+  echo "  removing non-registration entries from ${volume}"
+  find "$mountpoint" -mindepth 1 -maxdepth 1 \
+    ! -name .runner \
+    ! -name .credentials \
+    ! -name .credentials_rsaparams \
+    -exec rm -rf {} +
+}
+
+cmd_cleanup_volumes() {
+  local mode="dry-run" target="__all__" target_set=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        mode="dry-run"
+        shift
+        ;;
+      --apply)
+        mode="apply"
+        shift
+        ;;
+      --all)
+        target="__all__"
+        target_set=1
+        shift
+        ;;
+      cache | cache-data)
+        target="cache"
+        target_set=1
+        shift
+        ;;
+      runner-legacy | runner-data)
+        target="runner-legacy"
+        target_set=1
+        shift
+        ;;
+      -h | --help)
+        cleanup_usage
+        return 0
+        ;;
+      *)
+        die "unknown cleanup volumes argument: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$mode" == "apply" && "$target_set" == "0" ]]; then
+    die "cleanup volumes --apply requires cache, runner-data, or --all"
+  fi
+
+  require_compose
+  require_docker
+
+  case "$target" in
+    cache)
+      cmd_cleanup_volume_cache "$mode"
+      ;;
+    runner-legacy)
+      cmd_cleanup_volume_runner_legacy "$mode"
+      ;;
+    __all__)
+      cmd_cleanup_volume_cache "$mode"
+      cmd_cleanup_volume_runner_legacy "$mode"
+      ;;
+  esac
+}
+
 cmd_cleanup_all() {
   local mode="dry-run" until="168h" all_images=0
   local log_args docker_args
@@ -616,6 +967,7 @@ cmd_cleanup() {
   case "$subcommand" in
     logs) cmd_cleanup_logs "$@" ;;
     docker) cmd_cleanup_docker "$@" ;;
+    volumes | volume) cmd_cleanup_volumes "$@" ;;
     all) cmd_cleanup_all "$@" ;;
     help | -h | --help | "") cleanup_usage ;;
     *) die "unknown cleanup command: ${subcommand}" ;;
