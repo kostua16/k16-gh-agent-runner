@@ -150,6 +150,8 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 ./manage.sh logs runner    # follow runner logs
 ./manage.sh issues         # scan recent runner logs for known failures
 ./manage.sh ps             # status
+./manage.sh disk --top 10  # inspect Docker/containerd disk growth
+./manage.sh cleanup all --dry-run
 ./manage.sh restart
 ./manage.sh pull           # pull latest images
 ./manage.sh replace-token --token "$RUNNER_TOKEN"
@@ -163,11 +165,37 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 | `logs [service]` | Follow logs (`runner`, `cache-server`) |
 | `issues [service]` | Scan recent logs for stale tokens, auth failures, session conflicts, URL mismatches, and network errors |
 | `ps`, `status` | Container status |
+| `disk [--top N]` | Show Docker/containerd usage, stack container writable layers, JSON log sizes, and runner-internal disk usage |
+| `cleanup logs [service\|--all] [--dry-run\|--apply]` | Truncate compose-managed Docker JSON logs; defaults to dry-run |
+| `cleanup docker [--dry-run\|--apply] [--until 168h] [--all-images]` | Prune stopped containers, images, and build cache; volumes are never pruned |
+| `cleanup all [--dry-run\|--apply]` | Run log cleanup for all stack services, then conservative Docker cleanup |
 | `restart [service]` | Restart |
 | `pull` | Pull images |
 | `replace-token [--token TOKEN]` | Update `RUNNER_TOKEN`, clear persisted runner registration, and restart the runner |
 
 From a clone, `make up`, `make down`, and `make logs` delegate to `manage.sh`.
+
+### Disk diagnostics and cleanup
+
+Use `disk` before cleanup to separate image size, container writable layers,
+Docker JSON logs, and containerd snapshot growth:
+
+```bash
+./manage.sh disk --top 10
+```
+
+Cleanup commands are dry-run by default and only act when `--apply` is passed:
+
+```bash
+./manage.sh cleanup logs runner --dry-run
+./manage.sh cleanup logs runner --apply
+./manage.sh cleanup docker --dry-run
+./manage.sh cleanup docker --apply
+```
+
+`cleanup docker` prunes stopped containers, unused images, and build cache older
+than `--until` (default `168h`). It does not prune Docker volumes or delete
+anything directly under `/var/lib/containerd`.
 
 ## Configuration
 
