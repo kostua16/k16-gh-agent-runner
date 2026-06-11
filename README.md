@@ -273,6 +273,11 @@ Push to GHCR (requires `gh auth login`):
 make push
 ```
 
+`make push` uses Docker Buildx and publishes a multi-arch manifest for
+`linux/amd64` and `linux/arm64` by default. Override with
+`PLATFORMS=linux/amd64 make push` (or another comma-separated platform list)
+when you intentionally want a narrower publish.
+
 Run the stack from a clone:
 
 ```bash
@@ -280,7 +285,7 @@ cp .env.example .env   # edit secrets
 make up
 ```
 
-CI publishes the image on push to `main` and version tags via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to `ghcr.io/kostua16/k16-gh-agent-runner`.
+CI publishes the image on push to `main` and version tags via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to `ghcr.io/kostua16/k16-gh-agent-runner` as a multi-arch image (`linux/amd64`, `linux/arm64`).
 
 ## Project layout
 
