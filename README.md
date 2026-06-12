@@ -105,11 +105,15 @@ To refresh runtime files on an existing install (new `docker-compose.yml`, `mana
 
 ```bash
 ./manage.sh upgrade
+./manage.sh upgrade --all                     # also refresh cache-server and clear caches/logs
+./manage.sh upgrade --token "$RUNNER_TOKEN"   # only needed when registration state is missing
 # or:
 curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/install.sh | bash -s -- --update
 ```
 
-This downloads updated files from `main`, merges any new keys from `.env.example` into your existing `.env` (keeping your values), and runs `down` → `pull` → `up`.
+This downloads updated files from `main`, merges any new keys from `.env.example` into your existing `.env` (keeping your values), captures existing runner registration files, pulls images with retries before stopping the runner, then restarts the stack. If pulling fails, the existing runner is left running. The 20s GitHub session wait only runs when the runner was actually running before upgrade.
+
+Use `./manage.sh upgrade --all` for a fuller maintenance pass: it truncates compose-managed Docker JSON logs, clears the cache-server `cache-data` volume, stops/removes the cache-server container, and force-recreates the stack after pulling images.
 
 `./manage.sh upgrade` is safe while `manage.sh` is running: the updater writes to a temp file and atomically replaces the on-disk script, so the current process keeps the old inode until it exits. The next `./manage.sh` invocation uses the new version.
 
@@ -157,6 +161,7 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 ./manage.sh pull           # pull latest images
 ./manage.sh replace-token --token "$RUNNER_TOKEN"
 ./manage.sh upgrade        # refresh files + restart stack
+./manage.sh upgrade --all  # also refresh cache-server + clear caches/logs
 ```
 
 | Command | Description |
@@ -174,6 +179,7 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 | `restart [service]` | Restart |
 | `pull` | Pull images |
 | `replace-token [--token TOKEN]` | Update `RUNNER_TOKEN`, clear persisted runner registration, and restart the runner |
+| `upgrade [--token TOKEN] [--all]` | Refresh runtime files and restart; `--all` also refreshes cache-server and clears compose logs/cache data |
 
 From a clone, `make up`, `make down`, and `make logs` delegate to `manage.sh`.
 
@@ -225,7 +231,9 @@ Copy [`.env.example`](.env.example) to `.env` or run the [install curl command](
 | `RUNNER_EPHEMERAL` | `true` for ephemeral runners |
 | `RUNNER_REMOVE_ON_EXIT` | `true` to deregister from GitHub on container stop (default: keep registration) |
 
-Runner registration state is stored in the **`runner-data` Docker volume** (mounted at `/config` in the container). After the first successful start, `down` → `up` reuses credentials and does not need a fresh `RUNNER_TOKEN`. To force re-registration, generate a fresh GitHub runner registration token for the exact `GITHUB_URL`, then run:
+Runner registration state is stored in the **`runner-data` Docker volume** (mounted at `/config` in the container). After the first successful start, restarts and upgrades reuse credentials and do not need a fresh `RUNNER_TOKEN`. GitHub runner registration tokens expire quickly, so upgrade treats an old `.env` token as bootstrap-only. If registration state is missing, pass a fresh token for the exact `GITHUB_URL` or authenticate `gh` so the installer can fetch one before stopping the runner.
+
+To force re-registration, generate a fresh GitHub runner registration token for the exact `GITHUB_URL`, then run:
 
 ```bash
 ./manage.sh replace-token --token "$RUNNER_TOKEN"

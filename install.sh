@@ -13,10 +13,13 @@ MIGRATE_PATH=""
 MIGRATE_SOURCE=""
 CLI_TOKEN=""
 DO_UPDATE=0
+UPDATE_ALL=0
 RUNNER_HEALTH_WARN=0
+UPGRADE_BACKUP_DIR=""
 
 ENV_KEYS=()
 ENV_VALS=()
+RUNNER_CONFIG_FILES=(.runner .credentials .credentials_rsaparams)
 OPTIONAL_API_KEYS=(
   ANTHROPIC_API_KEY
   ZAI_API_KEY
@@ -112,9 +115,11 @@ Options:
                     Stops the old service, imports URL/name/labels, and
                     prefers `gh api` for a new registration token.
   --token TOKEN     Runner registration token (skips token prompt and
-                    overrides gh/legacy token lookup in --migrate)
+                    overrides gh lookup in --migrate or missing-state --update)
   --update          Refresh manage.sh, .env.example, and docker-compose.yml;
-                    merge new keys into existing .env, then down → pull → up
+                    merge new keys into existing .env, then pull → restart
+  --all             With --update, refresh cache-server too and clear compose
+                    Docker logs plus cache-server cache data
   -h, --help        Show this help
 
 Environment:
@@ -128,6 +133,8 @@ Examples:
   curl -fsSL .../install.sh | bash -s -- --token "$RUNNER_TOKEN"
   curl -fsSL .../install.sh | bash -s -- --migrate --token "$RUNNER_TOKEN"
   curl -fsSL .../install.sh | bash -s -- --update
+  curl -fsSL .../install.sh | bash -s -- --update --all
+  curl -fsSL .../install.sh | bash -s -- --update --token "$RUNNER_TOKEN"
   ./install.sh --migrate ~/actions-runner --token "$RUNNER_TOKEN"
 EOF
 }
@@ -148,6 +155,10 @@ parse_args() {
       --update)
         [[ -z "$MIGRATE_PATH" ]] || die "--migrate and --update cannot be used together"
         DO_UPDATE=1
+        shift
+        ;;
+      --all)
+        UPDATE_ALL=1
         shift
         ;;
       --token)
@@ -793,21 +804,273 @@ merge_env_update() {
   echo "  preserved existing values; added any new keys from .env.example"
 }
 
-refresh_stack() {
-  echo "==> Refreshing stack (down → pull → up)"
-  (cd "$INSTALL_DIR" && ./manage.sh down)
-  echo "==> Waiting for GitHub runner session to clear (20s)..."
-  sleep 20
-  warn_host_legacy_runner || true
-  (cd "$INSTALL_DIR" && ./manage.sh pull)
-  if runner_token_set; then
-    :
-  elif [[ "$DO_UPDATE" == "1" ]]; then
-    echo "  RUNNER_TOKEN not set in .env; assuming runner-data volume has credentials"
-  else
-    require_runner_token
+cleanup_upgrade_backup() {
+  if [[ -n "$UPGRADE_BACKUP_DIR" && -d "$UPGRADE_BACKUP_DIR" ]]; then
+    rm -rf "$UPGRADE_BACKUP_DIR"
   fi
-  (cd "$INSTALL_DIR" && ./manage.sh up)
+}
+
+compose_cmd() {
+  (cd "$INSTALL_DIR" && docker compose -f docker-compose.yml "$@")
+}
+
+runner_container_id() {
+  local id
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    printf '%s' "$id"
+    return 0
+  done < <(compose_cmd ps -a -q runner 2>/dev/null || true)
+  return 1
+}
+
+runner_container_running() {
+  local id="$1" running
+  [[ -n "$id" ]] || return 1
+  running="$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null || true)"
+  [[ "$running" == "true" ]]
+}
+
+registration_backup_complete() {
+  [[ -f "$1/.runner" && -f "$1/.credentials" ]]
+}
+
+copy_registration_files() {
+  local src="$1" dest="$2" file
+  for file in "${RUNNER_CONFIG_FILES[@]}"; do
+    if [[ -f "${src}/${file}" ]]; then
+      cp "${src}/${file}" "${dest}/${file}"
+    fi
+  done
+  registration_backup_complete "$dest"
+}
+
+capture_runner_registration_from_container() {
+  local cid="$1" base="$2" dest="$3" candidate
+  candidate="$(mktemp -d "${dest}/candidate.XXXXXX")" || die "failed to create registration backup"
+
+  if docker cp "${cid}:${base}/.runner" "${candidate}/.runner" >/dev/null 2>&1 &&
+    docker cp "${cid}:${base}/.credentials" "${candidate}/.credentials" >/dev/null 2>&1; then
+    docker cp "${cid}:${base}/.credentials_rsaparams" "${candidate}/.credentials_rsaparams" >/dev/null 2>&1 || true
+    if copy_registration_files "$candidate" "$dest"; then
+      rm -rf "$candidate"
+      return 0
+    fi
+  fi
+
+  rm -rf "$candidate"
+  return 1
+}
+
+capture_runner_registration_from_volume() {
+  local dest="$1" candidate archive
+  candidate="$(mktemp -d "${dest}/volume.XXXXXX")" || die "failed to create registration backup"
+  archive="${candidate}/registration.tar"
+
+  # shellcheck disable=SC2016 # Expand variables inside the container shell.
+  if compose_cmd run --rm -T --no-deps --entrypoint sh runner -c 'set -eu
+cd /config
+test -f .runner
+test -f .credentials
+files=".runner .credentials"
+if [ -f .credentials_rsaparams ]; then
+  files="$files .credentials_rsaparams"
+fi
+tar -cf - $files' >"$archive" &&
+    tar -xf "$archive" -C "$candidate" 2>/dev/null &&
+    copy_registration_files "$candidate" "$dest"; then
+    rm -rf "$candidate"
+    return 0
+  fi
+
+  rm -rf "$candidate"
+  return 1
+}
+
+capture_runner_registration() {
+  local dest="$1" cid
+  cid="$(runner_container_id || true)"
+
+  if [[ -n "$cid" ]]; then
+    if capture_runner_registration_from_container "$cid" /config "$dest"; then
+      echo "  captured existing runner registration from container /config"
+      return 0
+    fi
+    if capture_runner_registration_from_container "$cid" /home/runner "$dest"; then
+      echo "  captured existing runner registration from legacy container /home/runner"
+      return 0
+    fi
+  fi
+
+  if capture_runner_registration_from_volume "$dest"; then
+    echo "  captured existing runner registration from runner-data volume"
+    return 0
+  fi
+
+  echo "  no persisted runner registration found; a fresh token will be required"
+  return 1
+}
+
+restore_runner_registration() {
+  local backup="$1"
+  registration_backup_complete "$backup" || return 1
+
+  echo "==> Restoring runner registration into runner-data"
+  # shellcheck disable=SC2016 # Expand variables inside the container shell.
+  compose_cmd run --rm -T --no-deps --entrypoint sh --volume "${backup}:/restore:ro" runner -c 'set -eu
+mkdir -p /config
+install -m 600 /restore/.runner /config/.runner
+install -m 600 /restore/.credentials /config/.credentials
+if [ -f /restore/.credentials_rsaparams ]; then
+  install -m 600 /restore/.credentials_rsaparams /config/.credentials_rsaparams
+fi'
+}
+
+pull_images_with_retry() {
+  local attempt=1 max_attempts=3 delay=10
+
+  while ((attempt <= max_attempts)); do
+    if ((attempt == 1)); then
+      echo "==> Pulling latest images"
+    else
+      echo "==> Pulling latest images (attempt ${attempt}/${max_attempts})"
+    fi
+
+    if compose_cmd pull; then
+      return 0
+    fi
+
+    if ((attempt == max_attempts)); then
+      return 1
+    fi
+
+    echo "warning: image pull failed; retrying in ${delay}s" >&2
+    sleep "$delay"
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  done
+}
+
+prepare_fresh_update_token() {
+  local github_url token
+
+  if apply_supplied_token; then
+    env_set RUNNER_REPLACE true
+    write_env_file
+    return 0
+  fi
+
+  github_url="$(env_get GITHUB_URL 2>/dev/null || true)"
+  [[ -n "$github_url" ]] || die "GITHUB_URL is missing from .env; cannot fetch a fresh runner token"
+  parse_github_target "$github_url"
+
+  if gh_auth_ok && [[ "$GITHUB_TARGET_TYPE" != "unsupported" ]]; then
+    echo "  fetching fresh RUNNER_TOKEN via gh api"
+    if token="$(gh_fetch_registration_token)"; then
+      env_set RUNNER_TOKEN "$token"
+      env_set RUNNER_REPLACE true
+      write_env_file
+      return 0
+    fi
+    echo "warning: gh api registration-token failed" >&2
+  elif [[ "$GITHUB_TARGET_TYPE" == "unsupported" ]]; then
+    echo "warning: non-github.com URL — cannot fetch a token via gh api" >&2
+  elif ! command -v gh >/dev/null 2>&1; then
+    echo "warning: gh is not installed on this host" >&2
+  else
+    echo "warning: gh is not authenticated; run gh auth login" >&2
+  fi
+
+  die "runner registration files were not found; existing .env RUNNER_TOKEN may be expired. Pass a fresh token with ./manage.sh upgrade --token \"\$RUNNER_TOKEN\" or authenticate gh and retry."
+}
+
+ensure_update_registration_ready() {
+  local backup="$1"
+  if registration_backup_complete "$backup"; then
+    return 0
+  fi
+
+  echo "==> Preparing fresh runner registration token"
+  prepare_fresh_update_token
+}
+
+stop_runner_for_upgrade() {
+  local runner_was_running="$1"
+
+  echo "==> Stopping runner service"
+  compose_cmd stop --timeout 60 runner 2>/dev/null || true
+  compose_cmd rm -f runner 2>/dev/null || true
+
+  if [[ "$runner_was_running" == "1" ]]; then
+    echo "==> Waiting for GitHub runner session to clear (20s)..."
+    sleep 20
+  fi
+}
+
+prune_upgrade_logs() {
+  echo "==> Pruning compose Docker logs"
+  (cd "$INSTALL_DIR" && ./manage.sh cleanup logs --all --apply)
+}
+
+clear_upgrade_cache_data() {
+  echo "==> Clearing cache-server cache data"
+  compose_cmd run --rm -T --no-deps --entrypoint sh cache-server -c 'set -eu
+rm -rf /data/cache /data/cache-server.db /data/cache-server.db-shm /data/cache-server.db-wal
+mkdir -p /data/cache'
+}
+
+refresh_cache_for_upgrade() {
+  echo "==> Stopping cache-server service"
+  compose_cmd stop --timeout 30 cache-server 2>/dev/null || true
+  compose_cmd rm -f cache-server 2>/dev/null || true
+  clear_upgrade_cache_data
+}
+
+refresh_stack() {
+  local runner_id runner_was_running=0
+  local -a up_args
+
+  echo "==> Refreshing stack (capture credentials → pull → restart)"
+  UPGRADE_BACKUP_DIR="$(mktemp -d "${INSTALL_DIR}/.upgrade-registration.XXXXXX")" || die "failed to create registration backup"
+  trap cleanup_upgrade_backup EXIT
+
+  runner_id="$(runner_container_id || true)"
+  if runner_container_running "$runner_id"; then
+    runner_was_running=1
+  fi
+
+  capture_runner_registration "$UPGRADE_BACKUP_DIR" || true
+
+  if ! pull_images_with_retry; then
+    die "image pull failed after 3 attempts; existing runner was left running"
+  fi
+
+  if ! registration_backup_complete "$UPGRADE_BACKUP_DIR"; then
+    capture_runner_registration "$UPGRADE_BACKUP_DIR" || true
+  fi
+
+  ensure_update_registration_ready "$UPGRADE_BACKUP_DIR"
+  warn_host_legacy_runner || true
+  if [[ "$UPDATE_ALL" == "1" ]]; then
+    if ! prune_upgrade_logs; then
+      echo "warning: failed to prune compose Docker logs; continuing upgrade" >&2
+    fi
+  fi
+  stop_runner_for_upgrade "$runner_was_running"
+  if [[ "$UPDATE_ALL" == "1" ]]; then
+    if ! refresh_cache_for_upgrade; then
+      echo "warning: failed to clear cache-server cache data; continuing upgrade" >&2
+    fi
+  fi
+  if registration_backup_complete "$UPGRADE_BACKUP_DIR"; then
+    restore_runner_registration "$UPGRADE_BACKUP_DIR"
+  fi
+
+  up_args=(up -d --remove-orphans)
+  if [[ "$UPDATE_ALL" == "1" ]]; then
+    up_args+=(--force-recreate)
+  fi
+  compose_cmd "${up_args[@]}"
   check_runner_health || RUNNER_HEALTH_WARN=1
 }
 
@@ -904,20 +1167,42 @@ start_stack() {
 }
 
 check_runner_health() {
-  local waits=5 id
+  local waits=12 stable=0 id inspect state running restarting restart_count previous_restart_count=""
   while ((waits > 0)); do
     sleep 2
     id="$(
       if cd "$INSTALL_DIR"; then
-        docker compose ps -q --status running runner 2>/dev/null || true
+        docker compose ps -q runner 2>/dev/null || true
       fi
     )"
     if [[ -n "$id" ]]; then
-      return 0
+      inspect="$(docker inspect -f '{{.State.Status}} {{.State.Running}} {{.State.Restarting}} {{.RestartCount}} {{.State.ExitCode}}' "$id" 2>/dev/null || true)"
+      if [[ -n "$inspect" ]]; then
+        read -r state running restarting restart_count _ <<<"$inspect"
+        if [[ "$state" == "running" && "$running" == "true" && "$restarting" != "true" ]]; then
+          if [[ -n "$previous_restart_count" && "$restart_count" != "$previous_restart_count" ]]; then
+            stable=1
+          else
+            stable=$((stable + 1))
+          fi
+          previous_restart_count="$restart_count"
+          if ((stable >= 3)); then
+            return 0
+          fi
+        else
+          stable=0
+          previous_restart_count="$restart_count"
+        fi
+      fi
     fi
     waits=$((waits - 1))
   done
-  echo "warning: runner container is not healthy yet — check logs:" >&2
+
+  echo "warning: runner container did not stay running; scanning recent issues:" >&2
+  if ! (cd "$INSTALL_DIR" && ./manage.sh issues) >&2; then
+    echo "  cd ${INSTALL_DIR} && ./manage.sh issues" >&2
+  fi
+  echo "Check logs:" >&2
   echo "  cd ${INSTALL_DIR} && ./manage.sh logs runner" >&2
   return 1
 }
@@ -959,6 +1244,10 @@ EOF
 
 main() {
   preflight
+  if [[ "$UPDATE_ALL" == "1" && "$DO_UPDATE" != "1" ]]; then
+    die "--all is only supported with --update"
+  fi
+
   mkdir -p "$INSTALL_DIR"
   cd "$INSTALL_DIR"
 
