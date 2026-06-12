@@ -9,6 +9,6 @@ if ! command -v shellcheck >/dev/null 2>&1; then
   exit 1
 fi
 
-shellcheck install.sh manage.sh runner.sh scripts/*.sh
-/bin/bash -n install.sh manage.sh runner.sh scripts/*.sh
+shellcheck entrypoint.sh install.sh manage.sh runner.sh scripts/*.sh
+/bin/bash -n entrypoint.sh install.sh manage.sh runner.sh scripts/*.sh
 echo "shell lint ok"

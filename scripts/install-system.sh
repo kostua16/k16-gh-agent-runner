@@ -123,6 +123,7 @@ apt-get install -y --no-install-recommends \
   unzip \
   ripgrep \
   gnupg \
+  gosu \
   make \
   shellcheck \
   openssh-client \

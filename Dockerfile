@@ -112,8 +112,10 @@ RUN /tmp/toolchain/install-common.sh runner-curl-bash-if-enabled \
     "--dir /home/runner/.local/bin" \
     "test -x /home/runner/.local/bin/agy"
 
+COPY entrypoint.sh /entrypoint.sh
 COPY runner.sh /runner.sh
-RUN chmod +x /runner.sh
-USER runner
+RUN chmod +x /entrypoint.sh /runner.sh
+USER root
 WORKDIR /home/runner
-ENTRYPOINT ["/runner.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/runner.sh"]
