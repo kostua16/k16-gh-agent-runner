@@ -273,10 +273,11 @@ Push to GHCR (requires `gh auth login`):
 make push
 ```
 
-`make push` uses Docker Buildx and publishes a multi-arch manifest for
-`linux/amd64` and `linux/arm64` by default. Override with
+`make push` uses local Docker Buildx and publishes a multi-arch manifest for
+`linux/amd64` and `linux/arm64` by default. Depending on the maintainer host,
+local multi-arch builds may use emulation. Override with
 `PLATFORMS=linux/amd64 make push` (or another comma-separated platform list)
-when you intentionally want a narrower publish.
+when you intentionally want a narrower local publish.
 
 Run the stack from a clone:
 
@@ -285,7 +286,7 @@ cp .env.example .env   # edit secrets
 make up
 ```
 
-CI publishes the image on push to `main` and version tags via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to `ghcr.io/kostua16/k16-gh-agent-runner` as a multi-arch image (`linux/amd64`, `linux/arm64`).
+CI publishes the image on push to `main` and version tags via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) to `ghcr.io/kostua16/k16-gh-agent-runner` as a multi-arch image (`linux/amd64`, `linux/arm64`). CI builds each architecture on a native GitHub-hosted runner, then merges the results into the final manifest.
 
 ## Project layout
 
