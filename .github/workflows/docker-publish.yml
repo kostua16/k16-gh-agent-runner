@@ -8,6 +8,7 @@ on:
       - ".dockerignore"
       - ".github/workflows/docker-publish.yml"
       - "Dockerfile"
+      - "entrypoint.sh"
       - "runner.sh"
       - "scripts/install-*.sh"
   workflow_dispatch:

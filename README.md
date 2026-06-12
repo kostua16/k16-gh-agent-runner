@@ -30,7 +30,7 @@ Production deployment is a **two-service** Compose stack ([`docker-compose.yml`]
 | **runner** | Self-hosted runner (needs `GITHUB_URL` + `RUNNER_TOKEN`) |
 | **cache-server** | [falcondev Actions cache server](https://github.com/falcondev-oss/github-actions-cache-server) for faster caching on the internal Docker network |
 
-The runner mounts **`/var/run/docker.sock`** so workflows can run Docker-based jobs. Your host user should be in the `docker` group (or equivalent).
+The runner mounts **`/var/run/docker.sock`** so workflows can run Docker-based jobs. On startup, the container grants the `runner` user access to the mounted socket's group before dropping privileges. Your host user still needs Docker access to manage the stack.
 
 The cache server is **not published on the host** (no port 3000 bind). Only the `runner` service reaches it at `http://cache-server:3000/`.
 
@@ -288,6 +288,7 @@ CI publishes the image on push to `main` and version tags via [`.github/workflow
 |------|---------|
 | `Dockerfile` | Runner image definition |
 | `runner.sh` | Runner entrypoint (register + run) |
+| `entrypoint.sh` | Container startup wrapper (Docker socket group setup + privilege drop) |
 | `scripts/install-*.sh` | Layered installers plus generic tool-install helpers (`install-toolchain.sh` remains a wrapper) |
 | `docker-compose.yml` | Production stack |
 | `docker-compose.build.yml` | Build overlay only |
