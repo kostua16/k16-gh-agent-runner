@@ -142,7 +142,7 @@ Commands:
   cleanup <logs|docker|volumes|all> [...]
                                     Dry-run or apply safe disk cleanup
   replace-token [--token TOKEN]     Replace RUNNER_TOKEN and re-register runner
-  upgrade                           Refresh runtime files and restart (install.sh --update)
+  upgrade [--token TOKEN] [--all]   Refresh runtime files and restart (install.sh --update)
   menu                              Interactive menu (default when no args)
   help                              Show this help
 
@@ -155,6 +155,8 @@ Examples:
   ./manage.sh cleanup logs runner --dry-run
   ./manage.sh cleanup docker --dry-run
   ./manage.sh replace-token --token "$RUNNER_TOKEN"
+  ./manage.sh upgrade --token "$RUNNER_TOKEN"
+  ./manage.sh upgrade --all
   ./manage.sh restart
 EOF
 }
@@ -549,7 +551,7 @@ cmd_disk() {
 }
 
 cmd_upgrade() {
-  curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update
+  curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update "$@"
 }
 
 cleanup_usage() {
@@ -1285,7 +1287,7 @@ run_command() {
     cleanup | clean) cmd_cleanup "$@" ;;
     replace-token | token | rotate-token) cmd_replace_token "$@" ;;
     --token | --token=*) cmd_replace_token "$cmd" "$@" ;;
-    upgrade) cmd_upgrade ;;
+    upgrade) cmd_upgrade "$@" ;;
     help | -h | --help) usage ;;
     menu | "") menu_loop ;;
     *)

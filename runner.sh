@@ -125,13 +125,16 @@ fi
 runner_pid=$!
 
 cleanup() {
+  local file
+
   stop_listener "$runner_pid"
 
   if is_true "${RUNNER_REMOVE_ON_EXIT:-false}" && runner_is_configured; then
     echo "Deregistering runner from GitHub..."
     ./config.sh remove --unattended || true
-    rm -f "${CONFIG_FILES[@]}"
-    rm -f "${RUNNER_CONFIG_DIR}/"* 2>/dev/null || true
+    for file in "${CONFIG_FILES[@]}"; do
+      rm -f "./${file}" "${RUNNER_CONFIG_DIR}/${file}" 2>/dev/null || true
+    done
   fi
 }
 
