@@ -113,7 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/i
 
 This downloads updated files from `main`, merges any new keys from `.env.example` into your existing `.env` (keeping your values), captures existing runner registration files, pulls images with retries before stopping the runner, then restarts the stack. If pulling fails, the existing runner is left running. The 20s GitHub session wait only runs when the runner was actually running before upgrade.
 
-Use `./manage.sh upgrade --all` for a fuller maintenance pass: it truncates compose-managed Docker JSON logs, clears the cache-server `cache-data` volume, stops/removes the cache-server container, and force-recreates the stack after pulling images. Add `--prune-unused` to run `cleanup docker --dangerous --apply` once the new image is pulled and the runner is recreated, removing old runner images left by previous pulls — this also deletes any rollback images not currently in use.
+Use `./manage.sh upgrade --all` for a fuller maintenance pass: it truncates compose-managed Docker JSON logs, clears the cache-server `cache-data` volume, stops/removes the cache-server container, and force-recreates the stack after pulling images. Add `--prune-unused` to run `cleanup docker --prune --apply` once the new image is pulled and the runner is recreated, removing old runner images left by previous pulls — this also deletes any rollback images not currently in use.
 
 `./manage.sh upgrade` is safe while `manage.sh` is running: the updater writes to a temp file and atomically replaces the on-disk script, so the current process keeps the old inode until it exits. The next `./manage.sh` invocation uses the new version.
 

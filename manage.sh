@@ -803,7 +803,11 @@ cmd_cleanup_docker_volumes() {
   if [[ -n "$runner_vol" ]]; then
     echo "  removing volume ${runner_vol}"
     if ! docker volume rm "$runner_vol" >/dev/null 2>&1; then
-      echo "  warning: could not remove ${runner_vol}; registration backup is safe at ${backup_dir}/${backup_name}"
+      if [[ "$reg_exists" == "1" ]]; then
+        echo "  warning: could not remove ${runner_vol}; registration backup is safe at ${backup_dir}/${backup_name}"
+      else
+        echo "  warning: could not remove ${runner_vol}; no registration was present (nothing to back up)"
+      fi
     else
       echo "  recreating ${runner_vol} (empty)"
       docker volume create "$runner_vol" >/dev/null 2>&1 || die "failed to recreate ${runner_vol}"
@@ -878,6 +882,13 @@ cmd_cleanup_docker() {
 
   [[ -n "$until" && "$until" != *[[:space:]]* ]] || die "--until must be a Docker duration or timestamp without spaces"
   require_docker
+
+  # --prune/--dangerous prune regardless of age, so an explicit --until would be
+  # silently ignored. Surface that so a destructive prune is not mistaken for a
+  # scoped one.
+  if [[ "$do_prune" == "1" && "$until" != "168h" ]]; then
+    echo "  note: --until=${until} is ignored by --prune/--dangerous; all unused images are pruned regardless of age"
+  fi
 
   # --prune (or --dangerous) drops the age filter and prunes all unused images
   # plus all build cache; under the containerd image store this reclaims the
