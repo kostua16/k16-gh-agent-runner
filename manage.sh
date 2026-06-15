@@ -142,7 +142,8 @@ Commands:
   cleanup <logs|docker|volumes|all> [...]
                                     Dry-run or apply safe disk cleanup
   replace-token [--token TOKEN]     Replace RUNNER_TOKEN and re-register runner
-  upgrade [--token TOKEN] [--all]   Refresh runtime files and restart (install.sh --update)
+  upgrade [--token TOKEN] [--all] [--prune-unused]
+                                    Refresh runtime files and restart (install.sh --update)
   menu                              Interactive menu (default when no args)
   help                              Show this help
 
@@ -154,9 +155,12 @@ Examples:
   ./manage.sh cleanup volumes --dry-run
   ./manage.sh cleanup logs runner --dry-run
   ./manage.sh cleanup docker --dry-run
+  ./manage.sh cleanup docker --prune --dry-run
+  ./manage.sh cleanup docker --dangerous --dry-run
   ./manage.sh replace-token --token "$RUNNER_TOKEN"
   ./manage.sh upgrade --token "$RUNNER_TOKEN"
   ./manage.sh upgrade --all
+  ./manage.sh upgrade --all --prune-unused
   ./manage.sh restart
 EOF
 }
@@ -551,7 +555,39 @@ cmd_disk() {
 }
 
 cmd_upgrade() {
-  curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update "$@"
+  local prune_unused=0
+  local -a pass_through=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prune-unused | --prune-unused=*)
+        prune_unused=1
+        shift
+        ;;
+      *)
+        pass_through+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # --prune-unused is owned by manage.sh and stripped from the install.sh
+  # passthrough so install.sh never sees it. After a successful upgrade the new
+  # runner image is already pulled and referenced by the recreated container,
+  # so pruning removes only the prior versions left behind by repeated pulls.
+  if [[ ${#pass_through[@]} -gt 0 ]]; then
+    curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update "${pass_through[@]}"
+  else
+    curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update
+  fi
+
+  if [[ "$prune_unused" == "1" ]]; then
+    require_docker
+    section "Post-upgrade image cleanup (--prune-unused)"
+    echo "  removing all unused images and build cache (no age filter)"
+    echo "  warning: images not used by any container are deleted, including rollback versions"
+    cmd_cleanup_docker --prune --apply
+  fi
 }
 
 cleanup_usage() {
@@ -565,14 +601,26 @@ Commands:
       Truncate Docker JSON logs for compose-managed containers only.
 
   cleanup docker [--dry-run|--apply] [--until 168h] [--all-images]
-      Prune stopped containers, images, and build cache. Volumes are never pruned.
+                 [--prune] [--volumes] [--dangerous]
+      Prune stopped containers/images/build cache older than --until (default).
+        --prune     drop the age filter; prune ALL unused images + build cache
+                    (reclaims /var/lib/containerd space under the image store).
+        --volumes   reset OUR volumes only: back up runner-data registration,
+                    compose down, rm cache-data + runner-data, recreate
+                    runner-data and restore registration, compose up. Stack
+                    downtime. Never host-wide.
+        --dangerous --prune + --volumes.
+      The default prune never touches volumes or networks.
 
   cleanup volumes [cache|runner-data|--all] [--dry-run|--apply]
-      Inspect or clean compose volumes. --apply requires an explicit target.
+      Safe, selective volume cleanup (keeps runner registration). --apply
+      requires an explicit target. For a full volume reset with backup, use
+      "cleanup docker --volumes" instead.
 
   cleanup all [--dry-run|--apply] [--until 168h] [--all-images]
-      Run log cleanup for all compose services, then Docker cleanup. Volume
-      cleanup is intentionally separate.
+              [--prune] [--volumes] [--dangerous]
+      Log cleanup for all compose services, then Docker cleanup with the same
+      prune/volumes/dangerous flags forwarded.
 EOF
 }
 
@@ -684,8 +732,107 @@ cmd_cleanup_logs() {
   [[ "$failed" == "0" ]]
 }
 
+# Reset our own compose volumes with a backup/restore of runner registration.
+# Scoped to cache-data + runner-data only (never host-wide system prune --volumes).
+# Causes stack downtime: back up registration -> compose down -> rm volumes ->
+# recreate runner-data -> restore registration -> compose up.
+cmd_cleanup_docker_volumes() {
+  local mode="$1"
+  local cache_vol runner_vol ts backup_dir backup_name reg_exists=0 runner_image
+
+  require_env
+  require_compose
+
+  cache_vol="$(find_compose_volume cache-data 2>/dev/null || true)"
+  runner_vol="$(find_compose_volume runner-data 2>/dev/null || true)"
+  runner_image="$(env_file_value RUNNER_IMAGE 2>/dev/null || true)"
+  [[ -n "$runner_image" ]] || runner_image="ghcr.io/kostua16/k16-gh-agent-runner:latest"
+
+  section "Docker Volume Reset (${mode})"
+  echo "  scoped to our compose volumes only (never host-wide)"
+  [[ -n "$cache_vol" ]] && echo "  cache-data: ${cache_vol}"
+  [[ -n "$runner_vol" ]] && echo "  runner-data: ${runner_vol}"
+  if [[ -z "$cache_vol" && -z "$runner_vol" ]]; then
+    echo "  no compose volumes found; nothing to reset"
+    return 0
+  fi
+
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  backup_dir="${ROOT}/backups"
+  backup_name="runner-data-${ts}.tar.gz"
+
+  if [[ "$mode" == "dry-run" ]]; then
+    if [[ -n "$runner_vol" ]]; then
+      echo "  would back up runner-data registration to: ${backup_dir}/${backup_name}"
+      echo "  would stop + remove containers (compose down --timeout 60)"
+      echo "  would remove + recreate volume: ${runner_vol}"
+      echo "  would restore .runner / .credentials / .credentials_rsaparams into ${runner_vol}"
+    fi
+    [[ -n "$cache_vol" ]] && echo "  would remove volume: ${cache_vol} (recreated empty on compose up)"
+    echo "  would start the stack (compose up -d)"
+    echo "  warning: stack downtime during reset"
+    echo "  dry-run only; re-run with --apply to reset volumes"
+    return 0
+  fi
+
+  mkdir -p "$backup_dir"
+
+  if [[ -n "$runner_vol" ]]; then
+    docker run --rm --entrypoint sh -v "${runner_vol}:/data:ro" "$runner_image" -c '[ -e /data/.runner ]' >/dev/null 2>&1 && reg_exists=1
+    if [[ "$reg_exists" == "1" ]]; then
+      echo "  backing up runner-data registration to ${backup_dir}/${backup_name}"
+      if ! docker run --rm --entrypoint sh -v "${runner_vol}:/data:ro" -v "${backup_dir}:/backup" "$runner_image" \
+          -c "cd /data && tar czf /backup/${backup_name} --ignore-failed-read .runner .credentials .credentials_rsaparams" >/dev/null 2>&1 ||
+         [[ ! -s "${backup_dir}/${backup_name}" ]]; then
+        die "runner-data backup failed or is empty; aborting before any destructive action"
+      fi
+      echo "  backup ok: ${backup_dir}/${backup_name} ($(path_usage "${backup_dir}/${backup_name}"))"
+    else
+      echo "  no runner registration in ${runner_vol}; nothing to back up"
+    fi
+  fi
+
+  echo "  stopping and removing containers"
+  "${COMPOSE[@]}" down --timeout 60
+
+  if [[ -n "$cache_vol" ]]; then
+    echo "  removing volume ${cache_vol}"
+    docker volume rm "$cache_vol" >/dev/null 2>&1 || echo "  warning: could not remove ${cache_vol} (still in use?)"
+  fi
+
+  if [[ -n "$runner_vol" ]]; then
+    echo "  removing volume ${runner_vol}"
+    if ! docker volume rm "$runner_vol" >/dev/null 2>&1; then
+      if [[ "$reg_exists" == "1" ]]; then
+        echo "  warning: could not remove ${runner_vol}; registration backup is safe at ${backup_dir}/${backup_name}"
+      else
+        echo "  warning: could not remove ${runner_vol}; no registration was present (nothing to back up)"
+      fi
+    else
+      echo "  recreating ${runner_vol} (empty)"
+      docker volume create "$runner_vol" >/dev/null 2>&1 || die "failed to recreate ${runner_vol}"
+      if [[ "$reg_exists" == "1" ]]; then
+        echo "  restoring registration files into ${runner_vol}"
+        docker run --rm --entrypoint sh -v "${runner_vol}:/data" -v "${backup_dir}:/backup:ro" "$runner_image" \
+          -c "cd /data && tar xzf /backup/${backup_name}" >/dev/null 2>&1 \
+          || echo "  warning: could not restore registration; run ./manage.sh replace-token --token \"\$RUNNER_TOKEN\""
+      fi
+    fi
+  fi
+
+  echo "  starting the stack"
+  "${COMPOSE[@]}" up -d
+
+  echo "  volume reset complete"
+  if [[ -n "$runner_vol" && "$reg_exists" == "1" ]]; then
+    echo "  runner-data backup kept at: ${backup_dir}/${backup_name}"
+  fi
+  echo "  if the runner fails to reconnect, run: ./manage.sh replace-token --token \"\$RUNNER_TOKEN\""
+}
+
 cmd_cleanup_docker() {
-  local mode="dry-run" until="168h" all_images=0 image_args
+  local mode="dry-run" until="168h" until_set=0 all_images=0 do_prune=0 do_volumes=0
+  local container_args image_args builder_args run_prune=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -700,14 +847,29 @@ cmd_cleanup_docker() {
       --until)
         [[ $# -ge 2 ]] || die "--until requires a value"
         until="$2"
+        until_set=1
         shift 2
         ;;
       --until=*)
         until="${1#--until=}"
+        until_set=1
         shift
         ;;
       --all-images)
         all_images=1
+        shift
+        ;;
+      --prune)
+        do_prune=1
+        shift
+        ;;
+      --volumes)
+        do_volumes=1
+        shift
+        ;;
+      --dangerous)
+        do_prune=1
+        do_volumes=1
         shift
         ;;
       -h | --help)
@@ -723,36 +885,61 @@ cmd_cleanup_docker() {
   [[ -n "$until" && "$until" != *[[:space:]]* ]] || die "--until must be a Docker duration or timestamp without spaces"
   require_docker
 
-  section "Docker Prune Cleanup (${mode})"
-  if [[ "$mode" == "dry-run" ]]; then
-    echo "  no changes will be made"
-    echo "  would run: docker container prune -f --filter until=${until}"
+  # --prune/--dangerous prune regardless of age, so an explicit --until would be
+  # silently ignored. Surface that so a destructive prune is not mistaken for a
+  # scoped one.
+  if [[ "$do_prune" == "1" && "$until_set" == "1" ]]; then
+    echo "  note: --until=${until} is ignored by --prune/--dangerous; all unused images are pruned regardless of age"
+  fi
+
+  # --prune (or --dangerous) drops the age filter and prunes all unused images
+  # plus all build cache; under the containerd image store this reclaims the
+  # /var/lib/containerd space the time-gated default leaves behind. The image
+  # prune runs unless --volumes was given alone; volume reset runs only when
+  # requested. --dangerous is both.
+  [[ "$do_prune" == "1" || "$do_volumes" == "0" ]] && run_prune=1
+
+  if [[ "$do_prune" == "1" ]]; then
+    container_args=(container prune -f)
+    image_args=(image prune -a -f)
+    builder_args=(builder prune -a -f)
+  else
+    container_args=(container prune -f --filter "until=${until}")
     if [[ "$all_images" == "1" ]]; then
-      echo "  would run: docker image prune -a -f --filter until=${until}"
+      image_args=(image prune -a -f --filter "until=${until}")
     else
-      echo "  would run: docker image prune -f --filter until=${until}"
+      image_args=(image prune -f --filter "until=${until}")
     fi
-    echo "  would run: docker builder prune -f --filter until=${until}"
-    echo "  volumes will not be pruned"
-
-    section "Current Docker Reclaimable Usage"
-    docker system df -v || true
-    return 0
+    builder_args=(builder prune -f --filter "until=${until}")
   fi
 
-  echo "  pruning stopped containers older than ${until}"
-  docker container prune -f --filter "until=${until}"
+  if [[ "$run_prune" == "1" ]]; then
+    section "Docker Prune Cleanup (${mode})"
+    if [[ "$do_prune" == "1" ]]; then
+      echo "  --prune: no age filter; all stopped containers, all unused images, all build cache"
+    fi
+    if [[ "$mode" == "dry-run" ]]; then
+      echo "  no changes will be made"
+      echo "  would run: docker ${container_args[*]}"
+      echo "  would run: docker ${image_args[*]}"
+      echo "  would run: docker ${builder_args[*]}"
+      echo "  these prune commands never touch volumes"
 
-  echo "  pruning images older than ${until}"
-  image_args=(image prune -f --filter "until=${until}")
-  if [[ "$all_images" == "1" ]]; then
-    image_args=(image prune -a -f --filter "until=${until}")
+      section "Current Docker Reclaimable Usage"
+      docker system df -v || true
+    else
+      echo "  pruning stopped containers"
+      docker "${container_args[@]}"
+      echo "  pruning unused images"
+      docker "${image_args[@]}"
+      echo "  pruning build cache"
+      docker "${builder_args[@]}"
+    fi
   fi
-  docker "${image_args[@]}"
 
-  echo "  pruning build cache older than ${until}"
-  docker builder prune -f --filter "until=${until}"
-  echo "  volumes were not pruned"
+  if [[ "$do_volumes" == "1" ]]; then
+    cmd_cleanup_docker_volumes "$mode"
+  fi
 }
 
 print_cache_volume_cleanup_plan() {
@@ -908,6 +1095,7 @@ cmd_cleanup_volumes() {
 
 cmd_cleanup_all() {
   local mode="dry-run" until="168h" all_images=0
+  local fwd_prune=0 fwd_volumes=0 fwd_dangerous=0
   local log_args docker_args
 
   while [[ $# -gt 0 ]]; do
@@ -933,6 +1121,18 @@ cmd_cleanup_all() {
         all_images=1
         shift
         ;;
+      --prune)
+        fwd_prune=1
+        shift
+        ;;
+      --volumes)
+        fwd_volumes=1
+        shift
+        ;;
+      --dangerous)
+        fwd_dangerous=1
+        shift
+        ;;
       -h | --help)
         cleanup_usage
         return 0
@@ -952,8 +1152,12 @@ cmd_cleanup_all() {
     log_args+=(--dry-run)
     docker_args+=(--dry-run)
   fi
-  if [[ "$all_images" == "1" ]]; then
-    docker_args+=(--all-images)
+  [[ "$all_images" == "1" ]] && docker_args+=(--all-images)
+  if [[ "$fwd_dangerous" == "1" ]]; then
+    docker_args+=(--dangerous)
+  else
+    [[ "$fwd_prune" == "1" ]] && docker_args+=(--prune)
+    [[ "$fwd_volumes" == "1" ]] && docker_args+=(--volumes)
   fi
 
   cmd_cleanup_logs "${log_args[@]}"
