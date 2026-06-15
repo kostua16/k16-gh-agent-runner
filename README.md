@@ -113,7 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/kostua16/k16-gh-agent-runner/main/i
 
 This downloads updated files from `main`, merges any new keys from `.env.example` into your existing `.env` (keeping your values), captures existing runner registration files, pulls images with retries before stopping the runner, then restarts the stack. If pulling fails, the existing runner is left running. The 20s GitHub session wait only runs when the runner was actually running before upgrade.
 
-Use `./manage.sh upgrade --all` for a fuller maintenance pass: it truncates compose-managed Docker JSON logs, clears the cache-server `cache-data` volume, stops/removes the cache-server container, and force-recreates the stack after pulling images.
+Use `./manage.sh upgrade --all` for a fuller maintenance pass: it truncates compose-managed Docker JSON logs, clears the cache-server `cache-data` volume, stops/removes the cache-server container, and force-recreates the stack after pulling images. Add `--prune-unused` to run `cleanup docker --dangerous --apply` once the new image is pulled and the runner is recreated, removing old runner images left by previous pulls — this also deletes any rollback images not currently in use.
 
 `./manage.sh upgrade` is safe while `manage.sh` is running: the updater writes to a temp file and atomically replaces the on-disk script, so the current process keeps the old inode until it exits. The next `./manage.sh` invocation uses the new version.
 
@@ -173,13 +173,13 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 | `ps`, `status` | Container status |
 | `disk [--top N]` | Show Docker/containerd usage, stack container writable layers, JSON log sizes, and runner-internal disk usage |
 | `cleanup logs [service\|--all] [--dry-run\|--apply]` | Truncate compose-managed Docker JSON logs; defaults to dry-run |
-| `cleanup docker [--dry-run\|--apply] [--until 168h] [--all-images]` | Prune stopped containers, images, and build cache; volumes are never pruned |
+| `cleanup docker [--dry-run\|--apply] [--until 168h] [--all-images] [--dangerous]` | Prune stopped containers/images/build cache; `--dangerous` drops the age filter and reclaims all unused images + build cache (frees containerd image-store space); volumes never pruned |
 | `cleanup volumes [cache\|runner-data\|--all] [--dry-run\|--apply]` | Inspect or clean stack volumes; `--apply` requires an explicit target |
 | `cleanup all [--dry-run\|--apply]` | Run log cleanup for all stack services, then conservative Docker cleanup |
 | `restart [service]` | Restart |
 | `pull` | Pull images |
 | `replace-token [--token TOKEN]` | Update `RUNNER_TOKEN`, clear persisted runner registration, and restart the runner |
-| `upgrade [--token TOKEN] [--all]` | Refresh runtime files and restart; `--all` also refreshes cache-server and clears compose logs/cache data |
+| `upgrade [--token TOKEN] [--all] [--prune-unused]` | Refresh runtime files and restart; `--all` also refreshes cache-server + clears logs/cache; `--prune-unused` runs `cleanup docker --dangerous --apply` after upgrade (removes unused images incl. rollback versions) |
 
 From a clone, `make up`, `make down`, and `make logs` delegate to `manage.sh`.
 
@@ -199,12 +199,17 @@ Cleanup commands are dry-run by default and only act when `--apply` is passed:
 ./manage.sh cleanup logs runner --apply
 ./manage.sh cleanup docker --dry-run
 ./manage.sh cleanup docker --apply
+./manage.sh cleanup docker --dangerous --dry-run
+./manage.sh cleanup docker --dangerous --apply
 ./manage.sh cleanup volumes --dry-run
 ```
 
-`cleanup docker` prunes stopped containers, unused images, and build cache older
-than `--until` (default `168h`). It does not prune Docker volumes or delete
-anything directly under `/var/lib/containerd`.
+`cleanup docker` prunes stopped containers, images, and build cache older than
+`--until` (default `168h`). It does not prune Docker volumes. With `--dangerous`
+the age filter is dropped entirely and it prunes **all** unused images and build
+cache; when Docker runs the containerd image store this reclaims the space under
+`/var/lib/containerd` that the time-gated prune leaves behind. Networks are not
+pruned.
 
 `cleanup volumes` is separate from `cleanup all`. It can clear disposable
 cache-server state from `cache-data`, or remove old non-registration files from

@@ -142,7 +142,8 @@ Commands:
   cleanup <logs|docker|volumes|all> [...]
                                     Dry-run or apply safe disk cleanup
   replace-token [--token TOKEN]     Replace RUNNER_TOKEN and re-register runner
-  upgrade [--token TOKEN] [--all]   Refresh runtime files and restart (install.sh --update)
+  upgrade [--token TOKEN] [--all] [--prune-unused]
+                                    Refresh runtime files and restart (install.sh --update)
   menu                              Interactive menu (default when no args)
   help                              Show this help
 
@@ -157,6 +158,7 @@ Examples:
   ./manage.sh replace-token --token "$RUNNER_TOKEN"
   ./manage.sh upgrade --token "$RUNNER_TOKEN"
   ./manage.sh upgrade --all
+  ./manage.sh upgrade --all --prune-unused
   ./manage.sh restart
 EOF
 }
@@ -551,7 +553,39 @@ cmd_disk() {
 }
 
 cmd_upgrade() {
-  curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update "$@"
+  local prune_unused=0
+  local -a pass_through=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prune-unused | --prune-unused=*)
+        prune_unused=1
+        shift
+        ;;
+      *)
+        pass_through+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  # --prune-unused is owned by manage.sh and stripped from the install.sh
+  # passthrough so install.sh never sees it. After a successful upgrade the new
+  # runner image is already pulled and referenced by the recreated container,
+  # so pruning removes only the prior versions left behind by repeated pulls.
+  if [[ ${#pass_through[@]} -gt 0 ]]; then
+    curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update "${pass_through[@]}"
+  else
+    curl -fsSL "$INSTALL_SH_URL" | bash -s -- --update
+  fi
+
+  if [[ "$prune_unused" == "1" ]]; then
+    require_docker
+    section "Post-upgrade image cleanup (--prune-unused)"
+    echo "  removing all unused images and build cache (no age filter)"
+    echo "  warning: images not used by any container are deleted, including rollback versions"
+    cmd_cleanup_docker --dangerous --apply
+  fi
 }
 
 cleanup_usage() {
@@ -564,13 +598,16 @@ Commands:
   cleanup logs [service|--all] [--dry-run|--apply]
       Truncate Docker JSON logs for compose-managed containers only.
 
-  cleanup docker [--dry-run|--apply] [--until 168h] [--all-images]
-      Prune stopped containers, images, and build cache. Volumes are never pruned.
+  cleanup docker [--dry-run|--apply] [--until 168h] [--all-images] [--dangerous]
+      Prune stopped containers, images, and build cache older than --until.
+      Volumes are never pruned. --dangerous drops the age filter and prunes ALL
+      unused images and ALL build cache; under the containerd image store this
+      reclaims /var/lib/containerd snapshot/content space.
 
   cleanup volumes [cache|runner-data|--all] [--dry-run|--apply]
       Inspect or clean compose volumes. --apply requires an explicit target.
 
-  cleanup all [--dry-run|--apply] [--until 168h] [--all-images]
+  cleanup all [--dry-run|--apply] [--until 168h] [--all-images] [--dangerous]
       Run log cleanup for all compose services, then Docker cleanup. Volume
       cleanup is intentionally separate.
 EOF
@@ -685,7 +722,8 @@ cmd_cleanup_logs() {
 }
 
 cmd_cleanup_docker() {
-  local mode="dry-run" until="168h" all_images=0 image_args
+  local mode="dry-run" until="168h" all_images=0 dangerous=0
+  local container_args image_args builder_args
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -710,6 +748,10 @@ cmd_cleanup_docker() {
         all_images=1
         shift
         ;;
+      --dangerous)
+        dangerous=1
+        shift
+        ;;
       -h | --help)
         cleanup_usage
         return 0
@@ -723,16 +765,33 @@ cmd_cleanup_docker() {
   [[ -n "$until" && "$until" != *[[:space:]]* ]] || die "--until must be a Docker duration or timestamp without spaces"
   require_docker
 
+  # --dangerous drops the age filter and prunes all unused images plus all build
+  # cache. When Docker runs the containerd image store this reclaims the
+  # /var/lib/containerd snapshot and content space that the time-gated prune
+  # leaves behind. Volumes and networks are never pruned by this command.
+  if [[ "$dangerous" == "1" ]]; then
+    container_args=(container prune -f)
+    image_args=(image prune -a -f)
+    builder_args=(builder prune -a -f)
+  else
+    container_args=(container prune -f --filter "until=${until}")
+    if [[ "$all_images" == "1" ]]; then
+      image_args=(image prune -a -f --filter "until=${until}")
+    else
+      image_args=(image prune -f --filter "until=${until}")
+    fi
+    builder_args=(builder prune -f --filter "until=${until}")
+  fi
+
   section "Docker Prune Cleanup (${mode})"
+  if [[ "$dangerous" == "1" ]]; then
+    echo "  --dangerous: no age filter; all stopped containers, all unused images, all build cache"
+  fi
   if [[ "$mode" == "dry-run" ]]; then
     echo "  no changes will be made"
-    echo "  would run: docker container prune -f --filter until=${until}"
-    if [[ "$all_images" == "1" ]]; then
-      echo "  would run: docker image prune -a -f --filter until=${until}"
-    else
-      echo "  would run: docker image prune -f --filter until=${until}"
-    fi
-    echo "  would run: docker builder prune -f --filter until=${until}"
+    echo "  would run: docker ${container_args[*]}"
+    echo "  would run: docker ${image_args[*]}"
+    echo "  would run: docker ${builder_args[*]}"
     echo "  volumes will not be pruned"
 
     section "Current Docker Reclaimable Usage"
@@ -740,18 +799,14 @@ cmd_cleanup_docker() {
     return 0
   fi
 
-  echo "  pruning stopped containers older than ${until}"
-  docker container prune -f --filter "until=${until}"
+  echo "  pruning stopped containers"
+  docker "${container_args[@]}"
 
-  echo "  pruning images older than ${until}"
-  image_args=(image prune -f --filter "until=${until}")
-  if [[ "$all_images" == "1" ]]; then
-    image_args=(image prune -a -f --filter "until=${until}")
-  fi
+  echo "  pruning unused images"
   docker "${image_args[@]}"
 
-  echo "  pruning build cache older than ${until}"
-  docker builder prune -f --filter "until=${until}"
+  echo "  pruning build cache"
+  docker "${builder_args[@]}"
   echo "  volumes were not pruned"
 }
 
@@ -907,7 +962,7 @@ cmd_cleanup_volumes() {
 }
 
 cmd_cleanup_all() {
-  local mode="dry-run" until="168h" all_images=0
+  local mode="dry-run" until="168h" all_images=0 dangerous=0
   local log_args docker_args
 
   while [[ $# -gt 0 ]]; do
@@ -933,6 +988,10 @@ cmd_cleanup_all() {
         all_images=1
         shift
         ;;
+      --dangerous)
+        dangerous=1
+        shift
+        ;;
       -h | --help)
         cleanup_usage
         return 0
@@ -954,6 +1013,9 @@ cmd_cleanup_all() {
   fi
   if [[ "$all_images" == "1" ]]; then
     docker_args+=(--all-images)
+  fi
+  if [[ "$dangerous" == "1" ]]; then
+    docker_args+=(--dangerous)
   fi
 
   cmd_cleanup_logs "${log_args[@]}"
