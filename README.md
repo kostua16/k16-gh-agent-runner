@@ -173,13 +173,13 @@ cd ~/k16-gh-agent-runner   # or your repo clone
 | `ps`, `status` | Container status |
 | `disk [--top N]` | Show Docker/containerd usage, stack container writable layers, JSON log sizes, and runner-internal disk usage |
 | `cleanup logs [service\|--all] [--dry-run\|--apply]` | Truncate compose-managed Docker JSON logs; defaults to dry-run |
-| `cleanup docker [--dry-run\|--apply] [--until 168h] [--all-images] [--dangerous]` | Prune stopped containers/images/build cache; `--dangerous` drops the age filter and reclaims all unused images + build cache (frees containerd image-store space); volumes never pruned |
+| `cleanup docker [--dry-run\|--apply] [--until 168h] [--all-images] [--prune] [--volumes] [--dangerous]` | Prune stopped containers/images/build cache older than `--until`; `--prune` drops the age filter (reclaims containerd image-store space); `--volumes` resets our volumes with a registration backup; `--dangerous` = `--prune` + `--volumes` |
 | `cleanup volumes [cache\|runner-data\|--all] [--dry-run\|--apply]` | Inspect or clean stack volumes; `--apply` requires an explicit target |
-| `cleanup all [--dry-run\|--apply]` | Run log cleanup for all stack services, then conservative Docker cleanup |
+| `cleanup all [--dry-run\|--apply] [--until 168h] [--all-images] [--prune] [--volumes] [--dangerous]` | Log cleanup for all stack services, then Docker cleanup with the same prune/volumes/dangerous flags forwarded |
 | `restart [service]` | Restart |
 | `pull` | Pull images |
 | `replace-token [--token TOKEN]` | Update `RUNNER_TOKEN`, clear persisted runner registration, and restart the runner |
-| `upgrade [--token TOKEN] [--all] [--prune-unused]` | Refresh runtime files and restart; `--all` also refreshes cache-server + clears logs/cache; `--prune-unused` runs `cleanup docker --dangerous --apply` after upgrade (removes unused images incl. rollback versions) |
+| `upgrade [--token TOKEN] [--all] [--prune-unused]` | Refresh runtime files and restart; `--all` also refreshes cache-server + clears logs/cache; `--prune-unused` runs `cleanup docker --prune --apply` after upgrade (removes unused images incl. rollback versions) |
 
 From a clone, `make up`, `make down`, and `make logs` delegate to `manage.sh`.
 
@@ -199,17 +199,31 @@ Cleanup commands are dry-run by default and only act when `--apply` is passed:
 ./manage.sh cleanup logs runner --apply
 ./manage.sh cleanup docker --dry-run
 ./manage.sh cleanup docker --apply
+./manage.sh cleanup docker --prune --dry-run
+./manage.sh cleanup docker --prune --apply
+./manage.sh cleanup docker --volumes --dry-run
 ./manage.sh cleanup docker --dangerous --dry-run
-./manage.sh cleanup docker --dangerous --apply
 ./manage.sh cleanup volumes --dry-run
 ```
 
 `cleanup docker` prunes stopped containers, images, and build cache older than
-`--until` (default `168h`). It does not prune Docker volumes. With `--dangerous`
-the age filter is dropped entirely and it prunes **all** unused images and build
-cache; when Docker runs the containerd image store this reclaims the space under
-`/var/lib/containerd` that the time-gated prune leaves behind. Networks are not
-pruned.
+`--until` (default `168h`); it never prunes volumes or networks.
+
+- **`--prune`** — drops the age filter and prunes **all** unused images and build
+  cache. When Docker runs the containerd image store this reclaims the space
+  under `/var/lib/containerd` that the time-gated prune leaves behind.
+- **`--volumes`** — resets **our own** volumes only (never host-wide). It backs
+  up the `runner-data` registration (`.runner`/`.credentials`/
+  `.credentials_rsaparams`), runs `compose down`, removes and recreates
+  `cache-data` + `runner-data`, restores the registration, then `compose up`.
+  This causes **stack downtime**; keep the printed backup path as a safety net,
+  and run `./manage.sh replace-token --token "$RUNNER_TOKEN"` if the runner fails
+  to reconnect.
+- **`--dangerous`** — `--prune` + `--volumes` (the scoped equivalent of a full
+  `system prune -a --volumes` with a registration backup).
+
+`cleanup volumes` (the subcommand) is the safe, selective path; `--volumes` (the
+flag on `cleanup docker`/`all`) is the destructive full reset.
 
 `cleanup volumes` is separate from `cleanup all`. It can clear disposable
 cache-server state from `cache-data`, or remove old non-registration files from
