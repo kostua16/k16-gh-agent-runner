@@ -831,7 +831,7 @@ cmd_cleanup_docker_volumes() {
 }
 
 cmd_cleanup_docker() {
-  local mode="dry-run" until="168h" all_images=0 do_prune=0 do_volumes=0
+  local mode="dry-run" until="168h" until_set=0 all_images=0 do_prune=0 do_volumes=0
   local container_args image_args builder_args run_prune=0
 
   while [[ $# -gt 0 ]]; do
@@ -847,10 +847,12 @@ cmd_cleanup_docker() {
       --until)
         [[ $# -ge 2 ]] || die "--until requires a value"
         until="$2"
+        until_set=1
         shift 2
         ;;
       --until=*)
         until="${1#--until=}"
+        until_set=1
         shift
         ;;
       --all-images)
@@ -886,7 +888,7 @@ cmd_cleanup_docker() {
   # --prune/--dangerous prune regardless of age, so an explicit --until would be
   # silently ignored. Surface that so a destructive prune is not mistaken for a
   # scoped one.
-  if [[ "$do_prune" == "1" && "$until" != "168h" ]]; then
+  if [[ "$do_prune" == "1" && "$until_set" == "1" ]]; then
     echo "  note: --until=${until} is ignored by --prune/--dangerous; all unused images are pruned regardless of age"
   fi
 
