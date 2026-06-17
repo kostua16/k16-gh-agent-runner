@@ -604,7 +604,8 @@ Commands:
                  [--prune] [--volumes] [--dangerous]
       Prune stopped containers/images/build cache older than --until (default).
         --prune     drop the age filter; prune ALL unused images + build cache
-                    (reclaims /var/lib/containerd space under the image store).
+                    (incl. buildx builder cache) and reclaim /var/lib/containerd
+                    space under the image store.
         --volumes   reset OUR volumes only: back up runner-data registration,
                     compose down, rm cache-data + runner-data, recreate
                     runner-data and restore registration, compose up. Stack
@@ -830,6 +831,42 @@ cmd_cleanup_docker_volumes() {
   echo "  if the runner fails to reconnect, run: ./manage.sh replace-token --token \"\$RUNNER_TOKEN\""
 }
 
+# Prune build cache for every buildx builder, including docker-container driver
+# builders whose cache lives in a state volume that `docker builder prune`
+# (default builder only) does not touch. The default docker-driver builder is
+# skipped because the regular builder prune already covers it.
+prune_buildx_cache() {
+  local mode="$1" name driver builders
+
+  docker buildx version >/dev/null 2>&1 || return 0
+
+  # `docker buildx ls --format` cannot dereference .Driver on its lsContext, so
+  # emit JSON and parse with jq when available (skips the docker-driver default
+  # builder, already covered by `docker builder prune`). Without jq, fall back to
+  # builder names only and attempt every one.
+  if command -v jq >/dev/null 2>&1; then
+    builders="$(docker buildx ls --format '{{json .}}' 2>/dev/null \
+      | jq -r 'if .Name then "\(.Name)\t\(.Driver)" else empty end' 2>/dev/null \
+      | awk '!seen[$0]++' || true)"
+  else
+    builders="$(docker buildx ls --format '{{.Name}}' 2>/dev/null \
+      | awk 'NF && !seen[$0]++' || true)"
+  fi
+  [[ -n "$builders" ]] || return 0
+
+  while IFS=$'\t' read -r name driver; do
+    [[ -n "$name" ]] || continue
+    [[ "$driver" == "docker" ]] && continue
+    if [[ "$mode" == "dry-run" ]]; then
+      echo "  would run: docker buildx prune -a -f --builder ${name}${driver:+ (${driver})}"
+    else
+      echo "  pruning buildx cache: builder ${name}${driver:+ (${driver})}"
+      docker buildx prune -a -f --builder "$name" >/dev/null 2>&1 \
+        || echo "  warning: could not prune buildx builder ${name}"
+    fi
+  done <<<"$builders"
+}
+
 cmd_cleanup_docker() {
   local mode="dry-run" until="168h" until_set=0 all_images=0 do_prune=0 do_volumes=0
   local container_args image_args builder_args run_prune=0
@@ -916,13 +953,14 @@ cmd_cleanup_docker() {
   if [[ "$run_prune" == "1" ]]; then
     section "Docker Prune Cleanup (${mode})"
     if [[ "$do_prune" == "1" ]]; then
-      echo "  --prune: no age filter; all stopped containers, all unused images, all build cache"
+      echo "  --prune: no age filter; all stopped containers, all unused images, all build cache (incl. buildx builder cache)"
     fi
     if [[ "$mode" == "dry-run" ]]; then
       echo "  no changes will be made"
       echo "  would run: docker ${container_args[*]}"
       echo "  would run: docker ${image_args[*]}"
       echo "  would run: docker ${builder_args[*]}"
+      [[ "$do_prune" == "1" ]] && prune_buildx_cache dry-run
       echo "  these prune commands never touch volumes"
 
       section "Current Docker Reclaimable Usage"
@@ -934,6 +972,7 @@ cmd_cleanup_docker() {
       docker "${image_args[@]}"
       echo "  pruning build cache"
       docker "${builder_args[@]}"
+      [[ "$do_prune" == "1" ]] && prune_buildx_cache apply
     fi
   fi
 

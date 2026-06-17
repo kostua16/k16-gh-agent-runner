@@ -210,8 +210,10 @@ Cleanup commands are dry-run by default and only act when `--apply` is passed:
 `--until` (default `168h`); it never prunes volumes or networks.
 
 - **`--prune`** — drops the age filter and prunes **all** unused images and build
-  cache. When Docker runs the containerd image store this reclaims the space
-  under `/var/lib/containerd` that the time-gated prune leaves behind.
+  cache, including buildx builder cache (the docker-container driver builder's
+  state volume, which `docker builder prune` alone does not clear). Under the
+  containerd image store this reclaims the `/var/lib/containerd` space the
+  time-gated prune leaves behind.
 - **`--volumes`** — resets **our own** volumes only (never host-wide). It backs
   up the `runner-data` registration (`.runner`/`.credentials`/
   `.credentials_rsaparams`), runs `compose down`, removes and recreates
